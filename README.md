@@ -28,8 +28,8 @@ Conventional 2D MOT pipelines (e.g., 2D IoU + rolling-EMA Re-ID such as DeepSORT
 3. **Clean-View Episodic Vault (`tracker/vault.py`)**
    - Eliminates naive rolling-EMA updates. Candidate crops enter a track's fixed-capacity `EpisodicVault` **only** after passing `CleanViewGate`:
      - Zero neighbor overlap (`neighbor IoU <= 0.05`, closer-object `IoS <= 0.05`)
-     - High detection confidence (`conf >= 0.60`)
-     - High Laplacian sharpness (`var >= 50.0`)
+     - High detection confidence (`conf >= 0.50`) and minimum box area (`area >= 500 px²`)
+     - Laplacian sharpness gating (`var >= 18.0`)
    - Protects the initial clean anchor view and uses diversity-preserving eviction when at capacity; `vault.ema_embedding` is recomputed strictly as the quality-weighted centroid of verified clean entries.
 
 4. **Online Hard-Negative Metric (`tracker/vault.py`)**
@@ -67,6 +67,7 @@ long-horizon-tracker/
 ├── run_tracker.py            # RTX-optimized main pipeline + Explainable Diagnostics Overlay
 ├── eval_metrics.py           # Controlled 3-sequence stress benchmark vs. NaiveEMATracker
 ├── render_comparison.py      # Synchronized side-by-side Baseline vs. Ours video renderer
+├── app.py                    # Local Streamlit diagnostics & benchmark dashboard
 └── benchmark_report.md       # Generated benchmark comparison report
 ```
 
@@ -123,6 +124,12 @@ Uses `YOLOv8n`, `DINOv2 (dinov2_vits14)` with batched GPU `roi_align` + FP16 aut
   --output output/comparison_side_by_side.mp4
 ```
 
+### 6. Launch Local Diagnostics & Benchmark Dashboard (`Streamlit`)
+
+```powershell
+.\.venv\Scripts\streamlit.exe run app.py
+```
+
 ---
 
 ## Verified Benchmark & Test Results
@@ -142,19 +149,27 @@ Uses `YOLOv8n`, `DINOv2 (dinov2_vits14)` with batched GPU `roi_align` + FP16 aut
 
 ### Real Video Performance (`data/test_video.mp4` — 1920×1080, 556 frames on RTX 4070 Laptop GPU)
 
-- **Main Diagnostics Pipeline (`run_tracker.py`)**: **`15.67 FPS`** end-to-end (`35.49s`, `2.24×` speedup over initial `6.98 FPS` FP32/PIL baseline; core loop `20.0–25.7 FPS`), achieving `3` verified `STITCH_COMMIT` recoveries (up to `50f` occlusion), `11` `DEPTH_OCCLUDED` vault freezes, and `11` `MARGIN_VETO` abstentions.
-- **Side-by-Side Comparison (`render_comparison.py`)**: **`16.32 FPS`** (`34.1s`) on identical detections, embeddings, and depth maps:
-  - **Baseline (`2D IoU + EMA`)**: **`42`** total unique IDs created (`41` unverified instant merges).
-  - **`LongHorizonTracker` (Ours)**: **`32`** total unique IDs created (**23.8% fewer fragmented IDs**, `3` verified multi-frame recoveries, `11` margin-ratio abstentions, `11` depth-occlusion locks).
+| Pipeline / Tracker | End-to-End FPS (incl. H.264) | Unique IDs Created | `STITCH_COMMIT` | `MARGIN_VETO` | `DEPTH_OCCLUDED` / `DEPTH_GATE` | Clean-View Vault (`stores / rejects`) | Ghosts (`spawned / expired`) |
+| :--- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Baseline (`2D IoU + EMA`)** (`render_comparison.py`) | `11.24 FPS` | `42` | *(41 instant merges)* | `0` | `0` / `0` | N/A | N/A |
+| **`LongHorizonTracker` (Ours)** (`run_tracker.py` / `render_comparison.py`) | **`15.18 FPS`** (`run_tracker`) / `11.24 FPS` (side-by-side) | **`21`** (**-50.0%**) | **`4`** (up to **`317f`** / `10.6s`) | **`51`** | **`12` / `4`** | **`205 / 1,926`** | **`12 / 0`** |
+
+- **Long-Horizon Recoveries on `test_video.mp4`**:
+  - `F127`: `P18 → #5` after `24f` (`sim=0.80`, `margin=0.30`)
+  - `F402`: `P67 → #14` after `90f` (`sim=0.73`, `margin=0.21`)
+  - `F475`: `P83 → #5` after **`317f` (`10.6s`)** (`sim=0.77`, `margin=0.11`)
+  - `F477`: `P77 → #2` after **`243f` (`8.1s`)** (`sim=0.73`, `margin=0.13`)
+- **Speed & Playback**: CUDA FP16 autocast + batched GPU `roi_align` + CMC-warped `--depth-stride 2` + compact `<= 90px` ghost ellipses + `VERIFYING (f/15)` probationary badges + `AsyncVideoWriter` with automatic `imageio-ffmpeg` H.264 (`avc1`, `yuv420p`, `+faststart`) transcoding (core inference+tracking loop: `19–25 FPS`).
 
 ### Invariant Unit Test Suite (`tests/test_invariants.py`)
 
 ```text
-tests/test_invariants.py::test_cmc_pan_recovery PASSED                   [ 20%]
-tests/test_invariants.py::test_depth_occlusion_vault_freeze PASSED       [ 40%]
-tests/test_invariants.py::test_60_frame_blackout_recovery PASSED         [ 60%]
-tests/test_invariants.py::test_lookalike_margin_veto PASSED              [ 80%]
-tests/test_invariants.py::test_metric_vault_cache_equivalence PASSED     [100%]
+tests/test_invariants.py::test_cmc_pan_recovery PASSED                   [ 16%]
+tests/test_invariants.py::test_depth_occlusion_vault_freeze PASSED       [ 33%]
+tests/test_invariants.py::test_60_frame_blackout_recovery PASSED         [ 50%]
+tests/test_invariants.py::test_lookalike_margin_veto PASSED              [ 66%]
+tests/test_invariants.py::test_metric_vault_cache_equivalence PASSED     [ 83%]
+tests/test_invariants.py::test_three_person_5sec_pillar_recovery PASSED  [100%]
 
-5 passed in 1.61s
+6 passed in 2.55s
 ```

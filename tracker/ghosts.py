@@ -25,22 +25,25 @@ class GhostConfig:
     """Configuration for the Scene-Constrained Ghost Particle Filter."""
 
     num_particles: int = 128
-    max_ghost_age: int = 180
+    max_ghost_age: int = 600
     pos_noise_px: float = 3.0
     vel_noise_px: float = 1.4
     vel_damping: float = 0.96
     max_speed_px: float = 35.0
     size_noise_frac: float = 0.012
     depth_noise: float = 0.012
-    depth_occluder_margin: float = 0.035
+    depth_occluder_margin: float = 0.06
+    static_occluder_margin: float = 0.05
     open_space_penalty: float = 0.86
     occluded_support_boost: float = 1.12
     border_support_factor: float = 0.97
     border_margin_px: float = 28.0
     resample_ess_ratio: float = 0.5
-    min_confidence: float = 0.05
-    open_space_conf_decay: float = 0.990
-    occluded_conf_decay: float = 0.998
+    min_confidence: float = 0.01
+    open_space_conf_decay: float = 0.995
+    occluded_conf_decay: float = 0.9995
+    corridor_base_px: float = 140.0
+    corridor_expand_px_per_frame: float = 4.5
 
 
 @dataclass
@@ -271,14 +274,14 @@ class SceneConstrainedGhostFilter:
                     closer = np.ones((N, len(act_boxes)), dtype=bool)
                 occluded_mask |= np.any(in_x & in_y & closer, axis=1)
 
-            # 3b. Occlusion by closer static scene geometry from monocular depth map
+            # 3b. Occlusion by closer static scene geometry (pillars/walls: scene_d > ghost_d + 0.05)
             in_frame = (px >= 0) & (px < w) & (py >= 0) & (py < h)
             if depth_map is not None and np.any(in_frame):
                 dm_h, dm_w = depth_map.shape[:2]
                 ix = np.clip((px[in_frame] * (dm_w / max(1.0, float(w)))).astype(np.int32), 0, dm_w - 1)
                 iy = np.clip((py[in_frame] * (dm_h / max(1.0, float(h)))).astype(np.int32), 0, dm_h - 1)
                 scene_d = depth_map[iy, ix]
-                static_occ = scene_d > (pd[in_frame] + self.cfg.depth_occluder_margin)
+                static_occ = scene_d > (pd[in_frame] + self.cfg.static_occluder_margin)
                 occluded_mask[in_frame] |= static_occ
 
             # 3c. Border exit / near-edge zone
@@ -382,3 +385,46 @@ class SceneConstrainedGhostFilter:
             )
         )
         return combined, mahal, depth_diff
+
+    def is_in_corridor(
+        self,
+        ghost_id: int,
+        det_box: np.ndarray,
+        frame_shape: Tuple[int, int],
+    ) -> Tuple[bool, float, float]:
+        """Time-expanded spatial gating corridor for long-horizon pillar/occlusion exits.
+
+        Expands reachable radius proportionally to `ghost.age` so a target walking behind
+        a wide pillar and exiting on either side reaches set-to-set gallery matching while
+        still gating out physically impossible cross-frame jumps on short occlusions.
+        """
+        ghost = self.ghosts.get(ghost_id)
+        if ghost is None:
+            return False, 1e9, 0.0
+
+        h, w = frame_shape[:2]
+        frame_diag = float(np.hypot(w, h))
+        det_cx = 0.5 * (float(det_box[0]) + float(det_box[2]))
+        det_cy = 0.5 * (float(det_box[1]) + float(det_box[3]))
+        det_diag = float(np.hypot(max(8.0, float(det_box[2] - det_box[0])), max(8.0, float(det_box[3] - det_box[1]))))
+        ghost_diag = float(
+            np.hypot(
+                max(8.0, float(ghost.mean_box[2] - ghost.mean_box[0])),
+                max(8.0, float(ghost.mean_box[3] - ghost.mean_box[1])),
+            )
+        )
+
+        # Base gate covers local box scale + time-expanded corridor proportional to occlusion age
+        base_radius = max(self.cfg.corridor_base_px, 1.5 * max(det_diag, ghost_diag))
+        corridor_radius = min(
+            frame_diag,
+            base_radius + float(ghost.age) * self.cfg.corridor_expand_px_per_frame,
+        )
+
+        # Measure shortest distance from detection to ghost mean OR any live particle hypothesis
+        mean_cx = 0.5 * (float(ghost.mean_box[0]) + float(ghost.mean_box[2]))
+        mean_cy = 0.5 * (float(ghost.mean_box[1]) + float(ghost.mean_box[3]))
+        dist_mean = float(np.hypot(det_cx - mean_cx, det_cy - mean_cy))
+        p_dists = np.hypot(ghost.particles[:, 0] - det_cx, ghost.particles[:, 1] - det_cy)
+        min_dist = min(dist_mean, float(np.min(p_dists))) if len(p_dists) > 0 else dist_mean
+        return min_dist <= corridor_radius, min_dist, corridor_radius

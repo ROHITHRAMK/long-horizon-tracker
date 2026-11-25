@@ -183,18 +183,21 @@ class TrackerConfig:
     min_active_iou_without_app: float = 0.15
     depth_gate_thresh: float = 0.22
     depth_ema_alpha: float = 0.25
-    depth_occluder_margin: float = 0.035
+    depth_occluder_margin: float = 0.06
     # AGENTS.md Invariant 2: pairwise active track IoU >= 0.25 locks farther track as DEPTH-OCCLUDED
     depth_occlusion_iou_thresh: float = 0.25
+    # Stage 1 kinematic/IoU fallback for isolated flicker / in-place clothing/posture changes
+    kinematic_fallback_iou: float = 0.25
+    kinematic_fallback_norm_dist: float = 0.45
 
     # Active -> LOST (Ghost) transition
-    max_active_miss: int = 5
-    occluded_ghost_delay: int = 2
+    max_active_miss: int = 25
+    occluded_ghost_delay: int = 3
     min_hits_for_ghost: int = 4
 
     # AGENTS.md Invariant 3 & 4: Probationary Stitching (>= 15f) & Margin-Ratio Abstention
     probation_frames: int = 15
-    max_probation_frames: int = 25
+    max_probation_frames: int = 40
     probation_max_miss: int = 2
     prob_match_cost_thresh: float = 0.65
     ghost_depth_gate: float = 0.35
@@ -255,7 +258,10 @@ class ProbationaryTrack:
     hits: int = 1
     time_since_update: int = 0
     last_box: np.ndarray = None
+    # All frames stored for continuity: (embedding, det_conf, is_clean)
     embeddings: List[Tuple[np.ndarray, float, bool]] = field(default_factory=list)
+    # Clean-View gated subset (IoU <= 0.05, conf >= 0.50, sharpness >= 18.0): (embedding, quality)
+    clean_embeddings: List[Tuple[np.ndarray, float]] = field(default_factory=list)
     best_candidate_ghost: Optional[int] = None
     best_score: float = 0.0
     second_best_score: float = 0.0
@@ -265,12 +271,33 @@ class ProbationaryTrack:
     def current_box(self) -> np.ndarray:
         return self.last_box if self.last_box is not None else self.kf.get_box()
 
-    def get_gallery_embeddings(self) -> np.ndarray:
-        """Return accumulated probationary embeddings, preferring clean-gated frames."""
-        clean = [emb for emb, _, is_clean in self.embeddings if is_clean]
-        chosen = clean if len(clean) >= 3 else [emb for emb, _, _ in self.embeddings]
-        if not chosen:
+    def add_observation(
+        self,
+        embedding: np.ndarray,
+        det_conf: float,
+        quality: float,
+        is_clean: bool,
+    ) -> None:
+        """Record frame embedding for continuity and separately tag Clean-View frames."""
+        emb = l2_normalize(embedding)
+        self.embeddings.append((emb, float(det_conf), bool(is_clean)))
+        if is_clean:
+            self.clean_embeddings.append((emb, float(quality)))
+
+    def get_gallery_embeddings(self, min_clean: int = 3, fallback_top_k: int = 5) -> np.ndarray:
+        """Prioritize clean probationary embeddings so pillar-edge/half-occluded crops don't dilute Re-ID.
+
+        Falls back to top-confidence embeddings ONLY when fewer than `min_clean` clean views exist.
+        """
+        if len(self.clean_embeddings) >= min_clean:
+            return np.stack([emb for emb, _ in self.clean_embeddings], axis=0).astype(np.float32)
+
+        if not self.embeddings:
             return np.zeros((0, 0), dtype=np.float32)
+
+        # Rank by (is_clean first, then detection confidence descending) and keep top-k
+        ranked = sorted(self.embeddings, key=lambda item: (item[2], item[1]), reverse=True)
+        chosen = [emb for emb, _, _ in ranked[: max(min_clean, min(fallback_top_k, len(ranked)))]]
         return np.stack(chosen, axis=0).astype(np.float32)
 
 
@@ -504,6 +531,9 @@ class LongHorizonTracker:
 
         for tr in self.active_tracks.values():
             tr.kf.warp(M)
+            if tr.time_since_update >= 2:
+                # Damp coasting velocity during multi-frame YOLO flickers so stationary targets stay anchored
+                tr.kf.mean[4:6] *= 0.85
             tr.kf.predict()
             tr.age += 1
             tr.time_since_update += 1
@@ -539,6 +569,19 @@ class LongHorizonTracker:
         if active_ids and dets:
             pred_boxes = np.stack([self.active_tracks[tid].kf.get_box() for tid in active_ids], axis=0)
             ious = iou_matrix(pred_boxes, det_boxes)
+            # Pairwise normalized center distance (relative to predicted box diagonal) for isolated kinematic fallback
+            pred_cx = 0.5 * (pred_boxes[:, 0] + pred_boxes[:, 2])
+            pred_cy = 0.5 * (pred_boxes[:, 1] + pred_boxes[:, 3])
+            pred_diag = np.maximum(
+                1.0,
+                np.hypot(pred_boxes[:, 2] - pred_boxes[:, 0], pred_boxes[:, 3] - pred_boxes[:, 1]),
+            )
+            det_cx = 0.5 * (det_boxes[:, 0] + det_boxes[:, 2])
+            det_cy = 0.5 * (det_boxes[:, 1] + det_boxes[:, 3])
+            norm_dist = (
+                np.hypot(pred_cx[:, None] - det_cx[None, :], pred_cy[:, None] - det_cy[None, :])
+                / pred_diag[:, None]
+            )
             cost = np.full((len(active_ids), len(dets)), LARGE_COST, dtype=np.float32)
 
             for r, tid in enumerate(active_ids):
@@ -547,6 +590,7 @@ class LongHorizonTracker:
                     if det.class_id != tr.class_id:
                         continue
                     iou_val = float(ious[r, c])
+                    ndist = float(norm_dist[r, c])
                     depth_diff = abs(float(det.depth) - tr.depth_ema)
 
                     # Depth Gate: reject crossing-path mismatches at incompatible depths
@@ -564,13 +608,28 @@ class LongHorizonTracker:
                         continue
 
                     app_dist = self.metric.distance(det.embedding, tr.vault, track_id=tid)
-                    # Require either meaningful spatial overlap or very strong appearance near predicted box
-                    if iou_val < self.cfg.min_active_iou_without_app and app_dist > 0.28:
-                        continue
-
                     combined = self.cfg.iou_weight * (1.0 - iou_val) + self.cfg.app_weight * app_dist
-                    if combined <= self.cfg.active_cost_thresh:
+                    if (
+                        (iou_val >= self.cfg.min_active_iou_without_app or app_dist <= 0.28)
+                        and combined <= self.cfg.active_cost_thresh
+                    ):
                         cost[r, c] = combined
+                    elif (
+                        iou_val >= self.cfg.kinematic_fallback_iou
+                        or ndist <= self.cfg.kinematic_fallback_norm_dist
+                    ):
+                        # Isolated kinematic/IoU fallback (handles in-place clothing/posture changes)
+                        other_track_competes = any(
+                            r2 != r and (ious[r2, c] >= 0.15 or norm_dist[r2, c] <= 0.50)
+                            for r2 in range(len(active_ids))
+                        )
+                        other_det_competes = any(
+                            c2 != c and (ious[r, c2] >= 0.15 or norm_dist[r, c2] <= 0.50)
+                            for c2 in range(len(dets))
+                        )
+                        if not other_track_competes and not other_det_competes:
+                            kin_cost = 0.50 * (1.0 - iou_val) + 0.50 * min(1.0, ndist)
+                            cost[r, c] = min(self.cfg.active_cost_thresh - 0.01, float(kin_cost))
 
             row_ind, col_ind = linear_sum_assignment(cost)
             for r, c in zip(row_ind, col_ind):
@@ -680,9 +739,9 @@ class LongHorizonTracker:
             tr.occluder_id = occluder_id
 
             miss_limit = self.cfg.occluded_ghost_delay if is_occluded_loss else self.cfg.max_active_miss
-            if tr.time_since_update > miss_limit:
+            if tr.time_since_update >= miss_limit:
                 del self.active_tracks[tid]
-                if tr.hits >= self.cfg.min_hits_for_ghost and len(tr.vault) >= 1:
+                if tr.hits >= self.cfg.min_hits_for_ghost and tr.vault.get_embeddings().size > 0:
                     self.ghost_filter.spawn_ghost(
                         track_id=tid,
                         class_id=tr.class_id,
@@ -704,13 +763,27 @@ class LongHorizonTracker:
                         if occluder_id is not None
                         else ("scene occlusion" if is_occluded_loss else "lost detection")
                     )
+                    used_fallback = len(tr.vault) == 0
+                    v_tag = "V=0+seed" if used_fallback else f"V={len(tr.vault)}"
                     self._emit(
                         events,
                         "GHOST_SPAWN",
                         tid,
-                        f"Ghost #{tid} spawned ({cause}, V={len(tr.vault)})",
+                        f"Ghost #{tid} spawned ({cause}, {v_tag})",
                         occluded=is_occluded_loss,
                         occluder_id=occluder_id,
+                        clean_entries=len(tr.vault),
+                        used_fallback=used_fallback,
+                    )
+                elif tr.hits >= self.cfg.min_hits_for_ghost:
+                    self._emit(
+                        events,
+                        "TRACK_DROPPED_NO_VAULT",
+                        tid,
+                        f"Dropped #{tid} without ghost (hits={tr.hits}, V=0, last={tr.last_clean_reason})",
+                        hits=tr.hits,
+                        last_clean_reason=tr.last_clean_reason,
+                        vault_rejected=tr.vault.total_rejected,
                     )
 
         # ------------------------------------------------------------------
@@ -775,8 +848,11 @@ class LongHorizonTracker:
                 det_depths[other_mask] if np.any(other_mask) else None,
                 frame_shape,
             )
-            pr.embeddings.append(
-                (l2_normalize(det.embedding), assess.quality if assess.is_clean else 0.2, assess.is_clean)
+            pr.add_observation(
+                det.embedding,
+                det_conf=det.score,
+                quality=assess.quality if assess.is_clean else 0.0,
+                is_clean=assess.is_clean,
             )
 
         # Spawn new PROBATIONARY tracks for unmatched detections (frame 1 cold-start initializes scene directly)
@@ -809,7 +885,12 @@ class LongHorizonTracker:
                 score=float(det.score),
                 created_frame=self.frame_idx,
                 last_box=det.box.copy(),
-                embeddings=[(l2_normalize(det.embedding), assess.quality if assess.is_clean else 0.2, assess.is_clean)],
+            )
+            pr.add_observation(
+                det.embedding,
+                det_conf=det.score,
+                quality=assess.quality if assess.is_clean else 0.0,
+                is_clean=assess.is_clean,
             )
             self.probationary_tracks[pid] = pr
             matched_prob[pid] = det_idx
@@ -842,10 +923,15 @@ class LongHorizonTracker:
         )
 
     def _evaluate_stitch_candidates(
-        self, pr: ProbationaryTrack, cur_box: np.ndarray, cur_depth: float
+        self,
+        pr: ProbationaryTrack,
+        cur_box: np.ndarray,
+        cur_depth: float,
+        frame_shape: Tuple[int, int],
     ) -> Tuple[Optional[int], float, float, float]:
         """Set-to-set gallery matching against LOST tracks (only called once hits >= probation_frames).
 
+        Applies depth gating AND time-expanded spatial corridor gating before gallery matching.
         Returns (best_gid, best_sim, second_best_sim, margin_ratio).
         """
         query_gallery = pr.get_gallery_embeddings()
@@ -862,6 +948,10 @@ class LongHorizonTracker:
 
             _, _, depth_diff = self.ghost_filter.score_detection(gid, cur_box, cur_depth)
             if depth_diff > self.cfg.ghost_depth_gate:
+                continue
+
+            in_corridor, _, _ = self.ghost_filter.is_in_corridor(gid, cur_box, frame_shape)
+            if not in_corridor:
                 continue
 
             set_sim = self.metric.set_to_set_similarity(query_gallery, vault, track_id=gid)
@@ -920,7 +1010,7 @@ class LongHorizonTracker:
             det = dets[det_idx]
 
             best_gid, best_sim, second_best_sim, ratio = self._evaluate_stitch_candidates(
-                pr, det.box, det.depth
+                pr, det.box, det.depth, frame_shape
             )
             pr.best_candidate_ghost = best_gid
             pr.best_score = best_sim
@@ -941,7 +1031,7 @@ class LongHorizonTracker:
 
             # Re-evaluate against remaining unclaimed LOST ghosts
             best_gid, best_sim, second_best_sim, ratio = self._evaluate_stitch_candidates(
-                pr, det.box, det.depth
+                pr, det.box, det.depth, frame_shape
             )
             margin = best_sim - second_best_sim
             pr.best_candidate_ghost = best_gid
@@ -1027,16 +1117,40 @@ class LongHorizonTracker:
                 )
                 continue
 
-            # Case B: No lost track reached best_sim >= 0.72 -> graduate as a brand-new active track
+            # Case B: Candidate is near threshold (0.58 <= best_sim < 0.72) and still gathering clean views
+            clean_view_count = len(pr.clean_embeddings)
+            if (
+                best_gid is not None
+                and best_gid not in claimed_ghosts
+                and best_sim >= 0.58
+                and clean_view_count < 5
+                and pr.hits < self.cfg.max_probation_frames
+            ):
+                continue
+
+            # Case C: No lost track reached best_sim >= 0.72 -> graduate as a brand-new active track
             tr = self._spawn_active_track(
                 det, frame_bgr, det_boxes, det_depths, det_idx, frame_shape
             )
             self.active_tracks[tr.track_id] = tr
             del self.probationary_tracks[pid]
+            if best_gid is not None:
+                msg = (
+                    f"Graduated P{pid} -> NEW #{tr.track_id} "
+                    f"(best=#{best_gid}, sim={best_sim:.2f}, s2={second_best_sim:.2f}, m={margin:.2f})"
+                )
+            else:
+                msg = f"Graduated P{pid} -> NEW #{tr.track_id} (no ghost candidate)"
             self._emit(
                 events,
                 "NEW_TRACK",
                 tr.track_id,
-                f"Graduated P{pid} -> NEW #{tr.track_id}",
+                msg,
                 prob_id=pid,
+                best_candidate_ghost=best_gid,
+                best_sim=best_sim,
+                second_best_sim=second_best_sim,
+                margin=margin,
+                ratio=ratio,
+                clean_views=clean_view_count,
             )

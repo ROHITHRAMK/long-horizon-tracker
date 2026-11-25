@@ -29,6 +29,7 @@ from run_tracker import (
     extract_box_depth,
     resolve_device,
     track_color_bgr,
+    transcode_to_h264,
     upload_frame_gpu,
     warp_depth_map,
 )
@@ -171,16 +172,19 @@ def _draw_ghosts_scaled(
         )
         eigvals, eigvecs = np.linalg.eigh(cov_s)
         eigvals = np.maximum(eigvals, 9.0)
-        ax1 = int(np.clip(1.5 * math.sqrt(float(eigvals[1])), 6, w // 2))
-        ax2 = int(np.clip(1.5 * math.sqrt(float(eigvals[0])), 6, h // 2))
+        # Cap drawn ellipse radii proportionally to <= 90px (at 1080p) / <= 90px in panel space
+        max_ell = min(90, max(24, int(round(90.0 * max(sx, sy)))))
+        ax1 = int(np.clip(1.5 * math.sqrt(float(eigvals[1])), 6, max_ell))
+        ax2 = int(np.clip(1.5 * math.sqrt(float(eigvals[0])), 6, max_ell))
         angle = float(math.degrees(math.atan2(eigvecs[1, 1], eigvecs[0, 1])))
         ell_r = max(ax1, ax2)
 
+        vis_r = max(ell_r, max_ell)
         pad = 6
-        rx1 = max(0, int(min(float(np.min(px_s)), cx - ell_r, x1)) - pad)
-        ry1 = max(54, int(min(float(np.min(py_s)), cy - ell_r, y1)) - pad)
-        rx2 = min(w, int(max(float(np.max(px_s)), cx + ell_r, x2)) + pad)
-        ry2 = min(h, int(max(float(np.max(py_s)), cy + ell_r, y2)) + pad)
+        rx1 = max(0, min(cx - vis_r, x1) - pad)
+        ry1 = max(54, min(cy - vis_r, y1) - pad)
+        rx2 = min(w, max(cx + vis_r, x2) + pad)
+        ry2 = min(h, max(cy + vis_r, y2) + pad)
 
         if rx2 > rx1 and ry2 > ry1:
             roi = panel[ry1:ry2, rx1:rx2]
@@ -268,7 +272,7 @@ def render_ours_panel(
         x1, y1, x2, y2 = _scale_box(pr.current_box(), sx, sy)
         col = veto_col if pr.last_veto_reason else amber
         draw_dashed_rect(panel, (x1, y1), (x2, y2), col, thickness=2, dash_len=6, gap_len=4)
-        p_label = f"PROBATIONARY P{pr.prob_id} ({pr.hits}/{probation_frames})"
+        p_label = f"VERIFYING ({pr.hits}/{probation_frames})"
         draw_label_pill(panel, p_label, (x1, max(72, y1)), (30, 30, 30), col, font_scale=0.39)
         if pr.last_veto_reason:
             draw_label_pill(panel, "ABSTAINED (VETO)", (x1, y2 + 15), veto_col, (255, 255, 255), font_scale=0.36)
@@ -336,7 +340,7 @@ def main() -> None:
     lh_cfg = TrackerConfig(
         det_thresh=args.conf,
         probation_frames=15,
-        ghost_config=GhostConfig(max_ghost_age=180),
+        ghost_config=GhostConfig(max_ghost_age=600),
     )
     ours = LongHorizonTracker(config=lh_cfg)
 
@@ -360,7 +364,14 @@ def main() -> None:
     print(f"[Video] Source={src_w}x{src_h} @ {src_fps:.2f} FPS ({total_frames} frames) -> Side-by-side={out_w}x{out_h}")
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = AsyncVideoWriter(str(out_path), fourcc, src_fps, (out_w, out_h), max_queue=32)
+    writer = AsyncVideoWriter(
+        str(out_path),
+        fourcc,
+        src_fps,
+        (out_w, out_h),
+        max_queue=32,
+        transcode_h264=True,
+    )
 
     depth_stride = max(1, args.depth_stride)
     use_gpu_frame = device == "cuda" and (encoder._model is not None or depth_est._model is not None)

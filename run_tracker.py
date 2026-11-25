@@ -11,8 +11,11 @@ import argparse
 from collections import deque
 import json
 import math
+import os
 from pathlib import Path
 import queue
+import shutil
+import subprocess
 import threading
 import time
 from typing import Any, Deque, Dict, List, Optional, Sequence, Tuple
@@ -227,8 +230,66 @@ def warp_depth_map(
     )
 
 
+def get_ffmpeg_binary() -> Optional[str]:
+    """Locate standalone ffmpeg via imageio-ffmpeg first, falling back to system PATH."""
+    try:
+        import imageio_ffmpeg
+
+        exe = imageio_ffmpeg.get_ffmpeg_exe()
+        if exe and Path(exe).exists():
+            return exe
+    except Exception:
+        pass
+    return shutil.which("ffmpeg")
+
+
+def transcode_to_h264(video_path: Path | str, crf: int = 23) -> bool:
+    """Transcode an OpenCV mp4v file in-place to browser-compatible H.264 (yuv420p + faststart)."""
+    src = Path(video_path)
+    if not src.exists():
+        return False
+    ffmpeg_exe = get_ffmpeg_binary()
+    if ffmpeg_exe is None:
+        print(f"[H264] ffmpeg not found; keeping original codec for {src}")
+        return False
+
+    tmp = src.with_name(f"{src.stem}.h264_tmp.mp4")
+    try:
+        subprocess.run(
+            [
+                ffmpeg_exe,
+                "-y",
+                "-i",
+                str(src),
+                "-c:v",
+                "libx264",
+                "-pix_fmt",
+                "yuv420p",
+                "-movflags",
+                "+faststart",
+                "-preset",
+                "fast",
+                "-crf",
+                str(crf),
+                "-an",
+                str(tmp),
+            ],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+        if tmp.exists() and tmp.stat().st_size > 0:
+            os.replace(str(tmp), str(src))
+            return True
+    except Exception as exc:
+        print(f"[H264] Transcode failed for {src} ({exc}); keeping original file")
+        if tmp.exists():
+            tmp.unlink(missing_ok=True)
+    return False
+
+
 class AsyncVideoWriter:
-    """Background producer-consumer video writer thread so encoding never stalls GPU inference."""
+    """Background producer-consumer video writer thread with automatic H.264 transcode on close."""
 
     def __init__(
         self,
@@ -237,7 +298,10 @@ class AsyncVideoWriter:
         fps: float,
         frame_size: Tuple[int, int],
         max_queue: int = 32,
+        transcode_h264: bool = True,
     ) -> None:
+        self._out_path = Path(out_path)
+        self._transcode_h264 = transcode_h264
         self._writer = cv2.VideoWriter(out_path, fourcc, fps, frame_size)
         if not self._writer.isOpened():
             raise RuntimeError(f"Failed to open VideoWriter for: {out_path}")
@@ -269,6 +333,8 @@ class AsyncVideoWriter:
         self._writer.release()
         if self._error is not None:
             raise self._error
+        if self._transcode_h264:
+            transcode_to_h264(self._out_path)
 
 
 class AppearanceEncoder:
@@ -529,9 +595,15 @@ EVENT_COLORS: Dict[str, Tuple[int, int, int]] = {
 class DiagnosticsOverlay:
     """Renders ghosts, covariance ellipses, probation links, HUD telemetry, and event ticker."""
 
-    def __init__(self, max_ticker_events: int = 6, show_depth_inset: bool = True) -> None:
+    def __init__(
+        self,
+        max_ticker_events: int = 6,
+        show_depth_inset: bool = True,
+        probation_frames: int = 15,
+    ) -> None:
         self.ticker: Deque[DiagnosticEvent] = deque(maxlen=max_ticker_events)
         self.show_depth_inset = show_depth_inset
+        self.probation_frames = max(15, int(probation_frames))
 
     def render(
         self,
@@ -596,19 +668,22 @@ class DiagnosticsOverlay:
             cy = int(round(0.5 * (g.mean_box[1] + g.mean_box[3])))
             eigvals, eigvecs = np.linalg.eigh(g.cov_xy)
             eigvals = np.maximum(eigvals, 16.0)
-            ax1 = int(np.clip(1.5 * math.sqrt(float(eigvals[1])), 8, w // 2))
-            ax2 = int(np.clip(1.5 * math.sqrt(float(eigvals[0])), 8, h // 2))
+            # Cap drawn ellipse radii to <= 90px (internal particle corridor stays full-scale)
+            max_ell = min(90, w // 2, h // 2)
+            ax1 = int(np.clip(1.5 * math.sqrt(float(eigvals[1])), 8, max_ell))
+            ax2 = int(np.clip(1.5 * math.sqrt(float(eigvals[0])), 8, max_ell))
             angle = float(math.degrees(math.atan2(eigvecs[1, 1], eigvecs[0, 1])))
             ell_r = max(ax1, ax2)
 
             x1, y1, x2, y2 = [int(round(v)) for v in g.mean_box]
 
-            # Tight ROI enclosing particle cloud, covariance ellipse, and mean box
+            # Compact visual ROI around the capped ghost ellipse & mean box (<= 90px radius)
+            vis_r = max(ell_r, 90)
             pad = 8
-            rx1 = max(0, int(min(float(np.min(p[:, 0])), cx - ell_r, x1)) - pad)
-            ry1 = max(0, int(min(float(np.min(p[:, 1])), cy - ell_r, y1)) - pad)
-            rx2 = min(w, int(max(float(np.max(p[:, 0])), cx + ell_r, x2)) + pad)
-            ry2 = min(h, int(max(float(np.max(p[:, 1])), cy + ell_r, y2)) + pad)
+            rx1 = max(0, min(cx - vis_r, x1) - pad)
+            ry1 = max(0, min(cy - vis_r, y1) - pad)
+            rx2 = min(w, max(cx + vis_r, x2) + pad)
+            ry2 = min(h, max(cy + vis_r, y2) + pad)
 
             if rx2 > rx1 and ry2 > ry1:
                 roi = canvas[ry1:ry2, rx1:rx2]
@@ -709,8 +784,7 @@ class DiagnosticsOverlay:
             col = veto_col if pr.last_veto_reason else amber
             draw_dashed_rect(canvas, (x1, y1), (x2, y2), col, thickness=2, dash_len=7, gap_len=5)
 
-            cand_str = f"->#{pr.best_candidate_ghost}?" if pr.best_candidate_ghost is not None else "->NEW?"
-            label = f"PROB P{pr.prob_id} {cand_str} ({pr.hits}) s:{pr.best_score:.2f} r:{pr.margin_ratio:.2f}"
+            label = f"VERIFYING ({pr.hits}/{self.probation_frames})"
             draw_label_pill(canvas, label, (x1, max(20, y1)), (30, 30, 30), col, font_scale=0.42)
 
             if pr.last_veto_reason:
@@ -851,7 +925,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--depth-stride", type=int, default=2, help="Run depth model every K frames")
     parser.add_argument("--device", type=str, default="auto", help="Inference device: auto, cuda, cpu")
     parser.add_argument("--max-frames", type=int, default=0, help="Stop after N frames (0 = full video)")
-    parser.add_argument("--max-ghost-age", type=int, default=180, help="Maximum frames to keep a Ghost alive")
+    parser.add_argument("--max-ghost-age", type=int, default=600, help="Maximum frames to keep a Ghost alive")
     parser.add_argument("--probation-frames", type=int, default=15, help="Minimum probation frames before stitching (>=15)")
     parser.add_argument("--no-depth-inset", action="store_true", help="Disable depth PiP overlay")
     parser.add_argument("--show", action="store_true", help="Display live OpenCV window")
@@ -887,7 +961,10 @@ def main() -> None:
         ghost_config=GhostConfig(max_ghost_age=args.max_ghost_age),
     )
     tracker = LongHorizonTracker(config=tracker_cfg)
-    overlay = DiagnosticsOverlay(show_depth_inset=not args.no_depth_inset)
+    overlay = DiagnosticsOverlay(
+        show_depth_inset=not args.no_depth_inset,
+        probation_frames=tracker_cfg.probation_frames,
+    )
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():

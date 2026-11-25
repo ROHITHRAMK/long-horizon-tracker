@@ -387,8 +387,8 @@ def test_lookalike_margin_veto() -> None:
     assert len(tracker.active_tracks) == 2
     lost_ids = set(tracker.active_tracks.keys())
 
-    # Phase 2: Drop both tracks for 15 frames so both become LOST ghosts
-    for _ in range(15):
+    # Phase 2: Drop both tracks for max_active_miss (25) frames so both become LOST ghosts
+    for _ in range(cfg.max_active_miss):
         tracker.update(frame, [], depth_map=depth_map)
 
     assert lost_ids.issubset(set(tracker.ghost_filter.ghosts.keys()))
@@ -551,3 +551,141 @@ def test_metric_vault_cache_equivalence() -> None:
     # Verify repeated hit from cache remains exact to 1e-6
     assert abs(metric.similarity(q_single, vault, apply_hn_penalty=False) - ref_s2) <= 1e-6
     assert abs(metric.set_to_set_similarity(q_set, vault) - ref_set2) <= 1e-6
+
+
+# ---------------------------------------------------------------------------
+# 6. 3-Person 5-Second (150-Frame) Static Pillar Occlusion Recovery
+# ---------------------------------------------------------------------------
+
+
+def test_three_person_5sec_pillar_recovery() -> None:
+    """Simulate 3 distinct people (IDs 1, 2, 3): Person A (ID 1) walks behind a closer
+    static depth pillar (disparity 0.90 vs person 0.45) and disappears completely for
+    150 frames (5 seconds @ 30 FPS) while Person B (ID 2) and Person C (ID 3) remain
+    visible and move around; Person A steps out from the opposite side of the pillar
+    with noisy half-occluded edge frames followed by clean slightly drifted views.
+
+    Assert:
+    - Ghost #1 survives the full 150-frame pillar occlusion with high confidence.
+    - Half-occluded pillar-edge frames do NOT dilute clean probationary query gallery.
+    - After >= 15 probationary frames, Person A recovers exact ID 1 (STITCH_COMMIT).
+    - 0 new IDs are minted (only IDs 1, 2, 3 ever exist), and Person A is never merged
+      into Person B (ID 2) or Person C (ID 3).
+    """
+    canvas = make_textured_canvas(height=600, width=800, seed=606)
+    frame = crop_panned_frame(canvas, 50, 50, out_h=480, out_w=640)
+
+    # Static depth map: background 0.25, wide closer pillar at x=[250..410] with disparity 0.90
+    depth_map = np.full((480, 640), 0.25, dtype=np.float32)
+    depth_map[:, 250:410] = 0.90
+
+    cfg = TrackerConfig(
+        probation_frames=15,
+        max_probation_frames=40,
+        stitch_min_sim=0.72,
+        margin_min_diff=0.08,
+        ghost_config=GhostConfig(max_ghost_age=600),
+    )
+    tracker = LongHorizonTracker(cfg)
+
+    # 3 distinct person identities
+    emb_a = make_unit_embedding(128, seed=611)
+    emb_b = make_unit_embedding(128, seed=612)
+    emb_c = make_unit_embedding(128, seed=613)
+    emb_pillar_noise = make_unit_embedding(128, seed=699)  # Half-occluded pillar-edge noise
+
+    def box_xy(cx: float, cy: float, bw: float = 76.0, bh: float = 152.0) -> np.ndarray:
+        return np.array([cx - bw / 2, cy - bh / 2, cx + bw / 2, cy + bh / 2], dtype=np.float32)
+
+    def moving_b_box(f: int) -> np.ndarray:
+        # Person B walks smoothly on left side (never overlapping A or C)
+        cx = 110.0 + 35.0 * np.sin(f * 0.05)
+        return box_xy(cx, 370.0)
+
+    def moving_c_box(f: int) -> np.ndarray:
+        # Person C walks smoothly on right-bottom side (never overlapping A's exit)
+        cx = 525.0 + 30.0 * np.cos(f * 0.04)
+        return box_xy(cx, 380.0)
+
+    # Phase 1 (Frames 1..25): All 3 people visible; Person A walks toward left edge of pillar
+    for f in range(1, 26):
+        ax = 110.0 + 5.6 * (f - 1)  # 110 -> 244 (steps into pillar edge at x=250)
+        dets = [
+            Detection(box=box_xy(ax, 180.0), score=0.92, class_id=0, embedding=perturb_embedding(emb_a, 0.96, 6100 + f), depth=0.45),
+            Detection(box=moving_b_box(f), score=0.92, class_id=0, embedding=perturb_embedding(emb_b, 0.96, 6200 + f), depth=0.55),
+            Detection(box=moving_c_box(f), score=0.92, class_id=0, embedding=perturb_embedding(emb_c, 0.96, 6300 + f), depth=0.62),
+        ]
+        tracker.update(frame, dets, depth_map=depth_map)
+
+    assert set(tracker.active_tracks.keys()) == {1, 2, 3}
+    assert len(tracker.active_tracks[1].vault) >= 4
+
+    # Phase 2 (Frames 26..175): 150-frame (5-second) complete disappearance of Person A behind pillar
+    ghost_a_spawned = False
+    for f in range(26, 176):
+        dets = [
+            Detection(box=moving_b_box(f), score=0.92, class_id=0, embedding=perturb_embedding(emb_b, 0.96, 6200 + f), depth=0.55),
+            Detection(box=moving_c_box(f), score=0.92, class_id=0, embedding=perturb_embedding(emb_c, 0.96, 6300 + f), depth=0.62),
+        ]
+        res = tracker.update(frame, dets, depth_map=depth_map)
+        if any(ev.event_type == "GHOST_SPAWN" and ev.track_id == 1 for ev in res.events):
+            ghost_a_spawned = True
+        assert {2, 3}.issubset(set(tracker.active_tracks.keys())), f"B/C lost at frame {f}"
+
+    assert ghost_a_spawned is True, "Person A must spawn a LOST ghost behind the pillar"
+    assert 1 in tracker.ghost_filter.ghosts, "Ghost #1 must survive full 150-frame (5s) pillar occlusion"
+    assert tracker.ghost_filter.ghosts[1].confidence >= 0.40, (
+        f"Pillar-occluded ghost decayed too fast: conf={tracker.ghost_filter.ghosts[1].confidence:.3f}"
+    )
+
+    # Phase 3 (Frames 176..200): Person A emerges from opposite (right) side of pillar (x=425 -> 545)
+    # First 5 frames are half-occluded/low-conf pillar-edge crops (conf=0.42, heavily noisy embedding);
+    # remaining frames are clean views with slight appearance drift (cos=0.84 to emb_a).
+    stitch_events = []
+    stitch_prob_hit = None
+    for idx, f in enumerate(range(176, 201), start=1):
+        ax = min(560.0, 425.0 + 4.5 * (idx - 1))
+        if idx <= 5:
+            # Half-occluded pillar-edge frame: fails CleanViewGate (conf < 0.50), noisy embedding
+            det_a = Detection(
+                box=box_xy(ax, 180.0),
+                score=0.42,
+                class_id=0,
+                embedding=l2_normalize(0.45 * emb_a + 0.55 * emb_pillar_noise),
+                depth=0.45,
+            )
+        else:
+            # Clean full-body view after clearing pillar edge, with slight appearance drift
+            det_a = Detection(
+                box=box_xy(ax, 180.0),
+                score=0.90,
+                class_id=0,
+                embedding=perturb_embedding(emb_a, 0.84, 6400 + f),
+                depth=0.45,
+            )
+
+        dets = [
+            det_a,
+            Detection(box=moving_b_box(f), score=0.92, class_id=0, embedding=perturb_embedding(emb_b, 0.96, 6200 + f), depth=0.55),
+            Detection(box=moving_c_box(f), score=0.92, class_id=0, embedding=perturb_embedding(emb_c, 0.96, 6300 + f), depth=0.62),
+        ]
+        res = tracker.update(frame, dets, depth_map=depth_map)
+
+        for ev in res.events:
+            if ev.event_type == "STITCH_COMMIT":
+                stitch_events.append(ev)
+                if stitch_prob_hit is None:
+                    stitch_prob_hit = idx
+
+        if idx < 15:
+            # Invariant 3: MUST remain PROBATIONARY for at least 15 frames
+            assert 1 not in tracker.active_tracks, f"Premature merge at probation frame {idx}"
+            assert len(stitch_events) == 0
+
+    assert stitch_prob_hit == 15, f"Expected STITCH_COMMIT at probation frame 15, got {stitch_prob_hit}"
+    assert len(stitch_events) == 1
+    assert stitch_events[0].track_id == 1, f"Expected recovery to ID 1, got #{stitch_events[0].track_id}"
+    assert set(tracker.active_tracks.keys()) == {1, 2, 3}
+    assert tracker.counters["new_ids"] == 3, f"Expected 0 new IDs minted (only 1, 2, 3), got {tracker.counters['new_ids']}"
+    assert tracker.counters["stitches"] == 1
+    assert 1 not in tracker.ghost_filter.ghosts

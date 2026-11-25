@@ -77,19 +77,19 @@ class CleanViewGate:
 
     Enforces AGENTS.md Invariant 1:
     - Zero neighbor overlap (neighbor IoU <= 0.05)
-    - High detection confidence (conf >= 0.60)
-    - High Laplacian sharpness (sharpness >= 50.0)
+    - High detection confidence (conf >= 0.50)
+    - Laplacian sharpness gating (sharpness >= 18.0)
     """
 
     def __init__(
         self,
-        min_conf: float = 0.60,
-        min_area: float = 900.0,
+        min_conf: float = 0.50,
+        min_area: float = 500.0,
         max_iou_overlap: float = 0.05,
         max_closer_ios: float = 0.05,
-        depth_occluder_margin: float = 0.035,
-        min_sharpness: float = 50.0,
-        border_margin_px: int = 3,
+        depth_occluder_margin: float = 0.06,
+        min_sharpness: float = 18.0,
+        border_margin_px: int = 0,
     ) -> None:
         self.min_conf = min_conf
         self.min_area = min_area
@@ -142,11 +142,13 @@ class CleanViewGate:
         if area < self.min_area or bw < 14.0 or bh < 18.0:
             return CleanViewAssessment(False, 0.0, "REJECT_SMALL_BOX")
 
-        # Check severe border clipping (touching >= 2 image edges)
+        # Optional border clipping gate (disabled when border_margin_px <= 0 so edge targets store clean views)
         m = self.border_margin_px
-        touches = int(box[0] <= m) + int(box[1] <= m) + int(box[2] >= w - m) + int(box[3] >= h - m)
-        if touches >= 2:
-            return CleanViewAssessment(False, 0.0, "REJECT_BORDER_CLIPPED")
+        touches = 0
+        if m > 0:
+            touches = int(box[0] <= m) + int(box[1] <= m) + int(box[2] >= w - m) + int(box[3] >= h - m)
+            if touches >= 2:
+                return CleanViewAssessment(False, 0.0, "REJECT_BORDER_CLIPPED")
 
         max_iou = 0.0
         max_closer_ios = 0.0
