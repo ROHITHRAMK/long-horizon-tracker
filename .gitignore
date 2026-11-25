@@ -1,0 +1,39 @@
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python caches & build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+
+# Test & tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Model weights
+*.pt
+*.pth
+*.onnx
+*.safetensors
+
+# Large output videos & runtime logs (keep repo lightweight)
+output/*.mp4
+output/*.avi
+output/*.mkv
+output/*.jsonl
+output/*.json
+data/*.mp4
+data/*.avi
+data/*.mkv
+
+# OS / IDE artifacts
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
