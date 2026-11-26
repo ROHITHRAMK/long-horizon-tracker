@@ -41,11 +41,15 @@ Launch with:
 from __future__ import annotations
 
 from collections import deque
+import base64
+import contextlib
 from dataclasses import dataclass, field
 from datetime import datetime
+import html as _html
 import json
 import math
 from pathlib import Path
+import queue
 import re
 import threading
 import time
@@ -56,6 +60,14 @@ import numpy as np
 import pandas as pd
 from scipy.optimize import linear_sum_assignment
 import streamlit as st
+
+try:
+    import plotly.graph_objects as go
+
+    PLOTLY_AVAILABLE = True
+except Exception:  # pragma: no cover
+    go = None  # type: ignore[assignment]
+    PLOTLY_AVAILABLE = False
 
 from run_tracker import (
     AppearanceEncoder,
@@ -75,6 +87,34 @@ from tracker import (
     GhostConfig,
     LongHorizonTracker,
     TrackerConfig,
+)
+from modules import (
+    BiometricVault,
+    CLIPTargetSearcher,
+    DEPTH_CATALOG,
+    DETECTOR_CATALOG,
+    HeatmapGenerator,
+    MaskCleaner,
+    NextGenDepthEstimator,
+    NextGenPoseDetector,
+    NextGenReIDEncoder,
+    PolygonZone,
+    PoseBehaviorAnalyzer,
+    REID_CATALOG,
+    ZONE_PRESETS,
+    ZoneAnalyzer,
+    apply_privacy_blur,
+    draw_zones_overlay,
+    export_to_tensorrt,
+    format_polygon_coords,
+    generate_forensic_csv,
+    generate_forensic_pdf,
+    load_clip_searcher,
+    load_mask_cleaner,
+    load_nextgen_depth_estimator,
+    load_nextgen_detector,
+    load_nextgen_reid_encoder,
+    parse_polygon_coords,
 )
 
 
@@ -147,18 +187,43 @@ class PosePersonDetector:
         self.conf = float(conf)
         self.device = device
         self.is_pose_model = "pose" in model_name.lower()
+        self._use_half = self.device == "cuda"
+        if self._use_half:
+            try:
+                import torch
+
+                if torch.cuda.is_available():
+                    torch.backends.cudnn.benchmark = True
+            except Exception:
+                pass
         self.model = YOLO(model_name)
 
     def detect(self, frame_bgr: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
         """Return (boxes_xyxy [N,4], scores [N], class_ids [N], keypoints_xyc [N,17,3])."""
-        results = self.model.predict(
-            frame_bgr,
-            imgsz=self.imgsz,
-            conf=self.conf,
-            classes=self.classes,
-            device=self.device,
-            verbose=False,
-        )
+        try:
+            results = self.model.predict(
+                frame_bgr,
+                imgsz=self.imgsz,
+                conf=self.conf,
+                classes=self.classes,
+                device=self.device,
+                half=self._use_half,
+                verbose=False,
+            )
+        except Exception:
+            if self._use_half:
+                self._use_half = False
+                results = self.model.predict(
+                    frame_bgr,
+                    imgsz=self.imgsz,
+                    conf=self.conf,
+                    classes=self.classes,
+                    device=self.device,
+                    half=False,
+                    verbose=False,
+                )
+            else:
+                raise
         if not results or results[0].boxes is None or len(results[0].boxes) == 0:
             return (
                 np.zeros((0, 4), dtype=np.float32),
@@ -736,11 +801,20 @@ class BiometricDINOv2Encoder:
         norms = np.maximum(np.linalg.norm(mat, axis=1, keepdims=True), 1e-8)
         return (mat / norms).astype(np.float32)
 
-    def _forward_chunked(self, batch: Any, chunk_size: int = 48) -> Any:
+    def _forward_chunked(self, batch: Any, chunk_size: int = 128) -> Any:
+        """Run a single batched FP16 forward pass on GPU (chunking only when batch > chunk_size)."""
         torch = self._torch
         use_cuda = self.device == "cuda"
-        parts = []
         n = batch.shape[0]
+        if n <= chunk_size:
+            with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_cuda):
+                feats = self._model(batch)
+            if isinstance(feats, (tuple, list)):
+                feats = feats[0]
+            feats = feats.float().reshape(feats.shape[0], -1)
+            return torch.nn.functional.normalize(feats, p=2, dim=1)
+
+        parts = []
         for start in range(0, n, chunk_size):
             sub = batch[start : start + chunk_size]
             with torch.amp.autocast("cuda", dtype=torch.float16, enabled=use_cuda):
@@ -838,7 +912,7 @@ class BiometricDINOv2Encoder:
             gray_norm = (gray_body - self._mean) / self._std
 
             all_crops = torch.cat([head_norm, head_flip, gray_norm], dim=0)
-            all_feats = self._forward_chunked(all_crops, chunk_size=48)
+            all_feats = self._forward_chunked(all_crops, chunk_size=128)
 
             f_head = all_feats[:n]
             f_head_flip = all_feats[n : 2 * n]
@@ -916,7 +990,7 @@ class BiometricDINOv2Encoder:
                 torso_crops = aligned[n:]
                 flip_crops = torch.flip(full_crops, dims=[3])
                 all_feats = self._forward_chunked(
-                    torch.cat([full_crops, flip_crops, torso_crops], dim=0), chunk_size=48
+                    torch.cat([full_crops, flip_crops, torso_crops], dim=0), chunk_size=128
                 )
                 full_flip = torch.nn.functional.normalize(0.5 * (all_feats[:n] + all_feats[n : 2 * n]), p=2, dim=1)
                 torso_emb = torch.nn.functional.normalize(all_feats[2 * n :], p=2, dim=1)
@@ -993,12 +1067,232 @@ def load_depth_estimator(depth_backend: str, device: str) -> DepthEstimator:
     return DepthEstimator(backend=depth_backend, device=device)
 
 
+@st.cache_resource(show_spinner=False)
+def get_biometric_vault(db_path: str = "data/biometric_vault.db") -> BiometricVault:
+    """Return a cached SQLite BiometricVault instance."""
+    return BiometricVault(db_path=db_path)
+
+
+def _resolve_tensorrt_or_pt(weights_name: str) -> Tuple[str, bool]:
+    """Auto-select `<stem>.engine` if a TensorRT engine already exists next to `.pt` weights."""
+    w = str(weights_name)
+    if w.lower().endswith(".pt"):
+        eng = Path(w).with_suffix(".engine")
+        if eng.exists():
+            return str(eng), True
+        eng_root = ROOT / eng.name
+        if eng_root.exists():
+            return str(eng_root), True
+    return w, w.lower().endswith(".engine")
+
+
+FAST_H264_OUTPUT_PARAMS: List[str] = [
+    "-preset",
+    "veryfast",
+    "-crf",
+    "22",
+    "-movflags",
+    "+faststart",
+    "-pix_fmt",
+    "yuv420p",
+]
+
+
+class FastH264VideoWriter:
+    """Single-pass asynchronous H.264 writer piping BGR24 frames straight into `imageio-ffmpeg`.
+
+    Eliminates the slow two-stage `mp4v` intermediate file + post-hoc ffmpeg transcode and uses
+    `-preset veryfast -crf 22 -movflags +faststart -pix_fmt yuv420p` for 2x-3x faster browser-ready
+    MP4 export. Falls back seamlessly to `AsyncVideoWriter` if `imageio-ffmpeg` pipe init fails.
+    """
+
+    def __init__(
+        self,
+        output_path: str,
+        fps: float,
+        frame_size: Tuple[int, int],
+        max_queue: int = 32,
+    ) -> None:
+        self.output_path = str(output_path)
+        self.fps = max(1.0, float(fps))
+        self.width = int(frame_size[0])
+        self.height = int(frame_size[1])
+        self._fallback: Optional[AsyncVideoWriter] = None
+        self._queue: Optional[queue.Queue[Optional[np.ndarray]]] = None
+        self._worker: Optional[threading.Thread] = None
+        self._error: List[BaseException] = []
+        self._closed = False
+
+        try:
+            import imageio_ffmpeg
+
+            Path(self.output_path).parent.mkdir(parents=True, exist_ok=True)
+            gen = imageio_ffmpeg.write_frames(
+                self.output_path,
+                size=(self.width, self.height),
+                pix_fmt_in="bgr24",
+                pix_fmt_out="yuv420p",
+                fps=self.fps,
+                codec="libx264",
+                macro_block_size=2,
+                ffmpeg_log_level="error",
+                output_params=list(FAST_H264_OUTPUT_PARAMS),
+            )
+            gen.send(None)
+            self._gen = gen
+            self._queue = queue.Queue(maxsize=max(4, int(max_queue)))
+            self._worker = threading.Thread(target=self._run, name="FastH264Writer", daemon=True)
+            self._worker.start()
+        except Exception:
+            self._gen = None
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self._fallback = AsyncVideoWriter(
+                self.output_path,
+                fourcc,
+                self.fps,
+                (self.width, self.height),
+                max_queue=max_queue,
+                transcode_h264=True,
+            )
+
+    def _run(self) -> None:
+        assert self._queue is not None and self._gen is not None
+        try:
+            while True:
+                item = self._queue.get()
+                if item is None:
+                    break
+                self._gen.send(item)
+        except BaseException as exc:  # pragma: no cover
+            self._error.append(exc)
+        finally:
+            try:
+                self._gen.close()
+            except BaseException as exc:  # pragma: no cover
+                if not self._error:
+                    self._error.append(exc)
+
+    def write(self, frame_bgr: np.ndarray) -> None:
+        if self._fallback is not None:
+            self._fallback.write(frame_bgr)
+            return
+        if self._error:
+            raise self._error[0]
+        if frame_bgr.shape[1] != self.width or frame_bgr.shape[0] != self.height:
+            frame_bgr = cv2.resize(frame_bgr, (self.width, self.height), interpolation=cv2.INTER_LINEAR)
+        if not frame_bgr.flags["C_CONTIGUOUS"]:
+            frame_bgr = np.ascontiguousarray(frame_bgr)
+        assert self._queue is not None
+        self._queue.put(frame_bgr)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._fallback is not None:
+            self._fallback.close()
+            return
+        if self._queue is not None:
+            self._queue.put(None)
+        if self._worker is not None:
+            self._worker.join()
+        if self._error:
+            raise self._error[0]
+
+
+def _compute_pairwise_max_ious(boxes: np.ndarray) -> Tuple[np.ndarray, float]:
+    """Vectorized per-box max IoU with any OTHER detection on the frame + global max pair IoU."""
+    n = len(boxes)
+    if n <= 1:
+        return np.zeros((n,), dtype=np.float32), 0.0
+    b = np.asarray(boxes, dtype=np.float32).reshape(n, 4)
+    x1 = np.maximum(b[:, None, 0], b[None, :, 0])
+    y1 = np.maximum(b[:, None, 1], b[None, :, 1])
+    x2 = np.minimum(b[:, None, 2], b[None, :, 2])
+    y2 = np.minimum(b[:, None, 3], b[None, :, 3])
+    inter = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+    areas = np.maximum(1.0, (b[:, 2] - b[:, 0]) * (b[:, 3] - b[:, 1]))
+    union = np.maximum(1e-6, areas[:, None] + areas[None, :] - inter)
+    iou_mat = inter / union
+    np.fill_diagonal(iou_mat, 0.0)
+    per_box_max = iou_mat.max(axis=1).astype(np.float32)
+    return per_box_max, float(per_box_max.max())
+
+
+def _should_run_depth_frame(
+    frame_idx: int,
+    last_depth_map: Optional[np.ndarray],
+    max_pair_iou: float,
+    depth_stride: int,
+    turbo_gpu: bool,
+) -> bool:
+    """Smart Depth Gating: run Depth Anything V2 on overlaps (IoU >= 0.15) or every 4th frame in Turbo mode."""
+    if last_depth_map is None:
+        return True
+    if turbo_gpu:
+        return (max_pair_iou >= 0.15) or ((frame_idx - 1) % 4 == 0)
+    return (frame_idx - 1) % max(1, int(depth_stride)) == 0
+
+
+def _should_run_arcface_for_det(
+    frame_idx: int,
+    pre_viewpoint: str,
+    matched_face_count: int,
+    face_stride: int,
+    turbo_gpu: bool,
+) -> bool:
+    """Pose-Gated ArcFace: skip BACK views; run every frame until >=4 face samples, then every 5th frame."""
+    if not turbo_gpu:
+        return (frame_idx - 1) % max(1, int(face_stride)) == 0
+    if pre_viewpoint == "BACK":
+        return False
+    if matched_face_count >= 4:
+        return (frame_idx - 1) % 5 == 0
+    return True
+
+
+def _should_run_dino_for_det(
+    frame_idx: int,
+    max_det_iou: float,
+    matched_prev_iou: float,
+    matched_is_occluded: bool,
+    matched_gallery_count: int,
+    turbo_gpu: bool,
+) -> bool:
+    """Adaptive DINOv2 Stride: skip 2/3 frames for clean, non-occluded, isolated tracks with >=5 gallery samples."""
+    if not turbo_gpu:
+        return True
+    if (
+        max_det_iou < 0.15
+        and matched_prev_iou >= 0.60
+        and (not matched_is_occluded)
+        and matched_gallery_count >= 5
+    ):
+        return (frame_idx - 1) % 3 == 0
+    return True
+
+
+def _match_det_to_prev_cache(
+    box: np.ndarray,
+    prev_active_cache: Dict[int, Dict[str, Any]],
+) -> Tuple[Optional[Dict[str, Any]], float]:
+    """Find best IoU match for a current detection against previous frame's active track cache."""
+    best_entry: Optional[Dict[str, Any]] = None
+    best_iou = 0.0
+    for entry in prev_active_cache.values():
+        ov = _box_iou_single(box, entry["box"])
+        if ov > best_iou:
+            best_iou = ov
+            best_entry = entry
+    return best_entry, best_iou
+
+
 def _close_writer_with_keepalive(
-    writer: AsyncVideoWriter,
+    writer: Any,
     progress_bar: Any,
     status_placeholder: Any,
 ) -> None:
-    """Finalize AsyncVideoWriter + H.264 ffmpeg transcode while keeping the Streamlit WebSocket alive."""
+    """Finalize H.264 video writer while keeping the Streamlit WebSocket alive."""
     err: List[BaseException] = []
 
     def _run_close() -> None:
@@ -2339,8 +2633,23 @@ class Pass2OverlayRenderer:
         pass2_face_locks: int,
         pass2_bio_merges: int,
         backend_info: str,
+        vault_names: Optional[Dict[int, str]] = None,
+        behavior_labels: Optional[Dict[int, str]] = None,
+        privacy_mode: str = "Off",
+        privacy_style: str = "Gaussian Blur",
     ) -> np.ndarray:
-        canvas = frame_bgr
+        if (privacy_mode or "Off").strip().lower() == "anonymize all faces":
+            canvas = apply_privacy_blur(
+                frame_bgr,
+                snap.active,
+                mode="Anonymize All Faces",
+                style=privacy_style,
+            )
+        else:
+            canvas = frame_bgr
+
+        vnames = vault_names or {}
+        blabels = behavior_labels or {}
 
         for ev in snap.events:
             if ev["event_type"] in (
@@ -2390,8 +2699,16 @@ class Pass2OverlayRenderer:
                 tag = f" [S{tr.stitched_count}]"
 
             face_icon = " [FACE]" if tr.has_face_lock and not tr.is_global_recovered else ""
-            header = f"#{tr.track_id}{tag}{face_icon} | d:{tr.depth_ema:.2f} | V:{tr.vault_len}/{tr.vault_max}"
+            v_lbl = f" {vnames[tr.track_id]}" if tr.track_id in vnames else ""
+            beh_state = blabels.get(tr.track_id, "")
+            beh_tag = f" [{beh_state}]" if beh_state in ("FALL_ALERT", "HANDS_RAISED", "RUNNING") else ""
+            header = f"#{tr.track_id}{v_lbl}{tag}{face_icon}{beh_tag} | d:{tr.depth_ema:.2f} | V:{tr.vault_len}/{tr.vault_max}"
             draw_label_pill(canvas, header, (x1, max(20, y1)), box_color, (15, 15, 15), font_scale=0.46, thickness=1)
+
+            if beh_state == "FALL_ALERT":
+                draw_label_pill(canvas, "FALL ALERT!", (x1, max(38, y1 - 22)), (35, 35, 235), (255, 255, 255), font_scale=0.50, thickness=2)
+            elif beh_state in ("HANDS_RAISED", "RUNNING"):
+                draw_label_pill(canvas, beh_state.replace("_", " "), (x1, max(38, y1 - 22)), (20, 130, 240), (255, 255, 255), font_scale=0.44, thickness=1)
 
             if tr.is_depth_occluded:
                 badge = (
@@ -2535,21 +2852,82 @@ def run_two_pass_biometric_job(
     conf_thresh: float,
     progress_bar: Any,
     status_placeholder: Any,
+    detector_imgsz: int = 768,
+    stepper_placeholder: Optional[Any] = None,
+    turbo_gpu: bool = True,
+    mask_clean_biometrics: bool = False,
+    match_vault: bool = True,
+    enable_pose_behavior: bool = True,
+    privacy_mode: str = "Off",
+    privacy_style: str = "Gaussian Blur",
+    camera_label: str = "Uploaded Video",
 ) -> Dict[str, Any]:
     """Execute Pass 1 (Pose + ArcFace + Head/Shape/Skin + LongHorizonTracker) + Pass 2 (Hierarchical Biometric Consolidation + H.264)."""
     device = resolve_device("auto")
+    torch_mod: Optional[Any] = None
+    if device == "cuda":
+        try:
+            import torch as _torch_mod
 
-    status_placeholder.markdown(f"**Loading cached Pose/Person Detector (`{detector_weights}` on `{device.upper()}`)...**")
+            torch_mod = _torch_mod
+            if _torch_mod.cuda.is_available():
+                _torch_mod.backends.cudnn.benchmark = True
+        except Exception:
+            torch_mod = None
+    else:
+        try:
+            import torch as _torch_mod
+
+            torch_mod = _torch_mod
+        except Exception:
+            torch_mod = None
+
+    if stepper_placeholder is not None:
+        stepper_placeholder.markdown(_render_pipeline_stepper(1), unsafe_allow_html=True)
+
+    resolved_det_weights, using_trt = _resolve_tensorrt_or_pt(detector_weights)
+    model_notes: List[str] = []
+
+    status_placeholder.markdown(f"**Loading cached Pose/Person Detector (`{resolved_det_weights}` on `{device.upper()}`)...**")
     progress_bar.progress(0.01)
-    detector = load_pose_detector(detector_weights=detector_weights, device=device)
+    use_nextgen_det = (
+        "yolo26" in resolved_det_weights.lower()
+        or "rfdetr" in resolved_det_weights.lower()
+        or using_trt
+    )
+    if use_nextgen_det:
+        detector: Any = load_nextgen_detector(model_name=resolved_det_weights, device=device)
+        if getattr(detector, "status_note", ""):
+            model_notes.append(detector.status_note)
+    else:
+        detector = load_pose_detector(detector_weights=resolved_det_weights, device=device)
 
-    status_placeholder.markdown(f"**Loading cached DINOv2 Backbone (`{reid_variant}` on `{device.upper()}`)...**")
+    status_placeholder.markdown(f"**Loading cached Re-ID Backbone (`{reid_variant}` on `{device.upper()}`)...**")
     progress_bar.progress(0.02)
-    encoder = load_reid_encoder(reid_variant=reid_variant, device=device)
+    use_nextgen_reid = ("dinov3" in reid_variant.lower()) or ("/" in reid_variant)
+    if use_nextgen_reid:
+        encoder: Any = load_nextgen_reid_encoder(variant=reid_variant, device=device)
+        if getattr(encoder, "status_note", ""):
+            model_notes.append(encoder.status_note)
+    else:
+        encoder = load_reid_encoder(reid_variant=reid_variant, device=device)
 
     status_placeholder.markdown(f"**Loading cached Depth Guard (`{depth_backend}` on `{device.upper()}`)...**")
     progress_bar.progress(0.03)
-    depth_est = load_depth_estimator(depth_backend=depth_backend, device=device)
+    use_nextgen_depth = depth_backend not in ("depth_anything", "midas_small", "y_prior")
+    if use_nextgen_depth:
+        depth_est: Any = load_nextgen_depth_estimator(backend=depth_backend, device=device)
+        if getattr(depth_est, "status_note", ""):
+            model_notes.append(depth_est.status_note)
+    else:
+        depth_est = load_depth_estimator(depth_backend=depth_backend, device=device)
+
+    mask_cleaner: Optional[MaskCleaner] = None
+    if mask_clean_biometrics and biometric_mode:
+        status_placeholder.markdown(f"**Loading cached Mask-Clean Segmentation (`yolo26m-seg` on `{device.upper()}`)...**")
+        mask_cleaner = load_mask_cleaner(model_name="yolo26m-seg.pt", device=device)
+        if getattr(mask_cleaner, "status_note", ""):
+            model_notes.append(mask_cleaner.status_note)
 
     face_analyzer: Optional[ArcFaceBiometricAnalyzer] = None
     if biometric_mode:
@@ -2559,7 +2937,7 @@ def run_two_pass_biometric_job(
 
     detector.classes = [0] if (people_only or biometric_mode) else None
     detector.conf = conf_thresh
-    detector.imgsz = 960
+    detector.imgsz = int(detector_imgsz)
 
     # Pass-1 LongHorizonTracker honors all AGENTS.md invariants (probation >= 15f, sim >= 0.72, margin >= 0.08)
     ghost_cfg = GhostConfig(
@@ -2600,6 +2978,12 @@ def run_two_pass_biometric_job(
     pass1_recoveries: List[Dict[str, Any]] = []
 
     faces_extracted_total = 0
+    depth_runs_total = 0
+    depth_skips_total = 0
+    dino_runs_total = 0
+    dino_skips_total = 0
+    face_skips_total = 0
+    prev_active_cache: Dict[int, Dict[str, Any]] = {}
     frame_count = 0
     t_start = time.perf_counter()
     last_ui_tick = t_start
@@ -2608,273 +2992,407 @@ def run_two_pass_biometric_job(
     # =======================================================================
     # PASS 1: Pose + Biometric Feature Extraction + LongHorizonTracker
     # =======================================================================
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        frame_count += 1
-        t0 = time.perf_counter()
+    infer_ctx = torch_mod.inference_mode() if torch_mod is not None else contextlib.nullcontext()
+    use_cuda_amp = device == "cuda" and torch_mod is not None
 
-        frame_gpu = upload_frame_gpu(frame, device) if use_gpu_frame else None
-        boxes, scores, cls_ids, kpts = detector.detect(frame)
-        raw_detections_per_frame.append(
-            [(boxes[i].copy(), float(scores[i]), int(cls_ids[i])) for i in range(len(boxes))]
-        )
+    with infer_ctx:
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_count += 1
+            t0 = time.perf_counter()
 
-        run_depth_now = last_depth_map is None or (frame_count - 1) % max(1, depth_stride) == 0
-        cmc_res = None
-        if run_depth_now:
-            last_depth_map = depth_est.predict(frame, frame_gpu=frame_gpu)
-        else:
-            cmc_res = tracker.cmc.update(frame, boxes)
-            last_depth_map = warp_depth_map(last_depth_map, cmc_res.matrix, frame.shape[:2])
-
-        n_det = len(boxes)
-        det_head_embs: List[Optional[np.ndarray]] = [None] * n_det
-        det_gray_embs: List[Optional[np.ndarray]] = [None] * n_det
-        det_face_obs: List[Optional[Tuple[np.ndarray, float]]] = [None] * n_det
-        det_body_ratios: List[Optional[Tuple[np.ndarray, np.ndarray]]] = [None] * n_det
-        det_skin_obs: List[Optional[Tuple[np.ndarray, np.ndarray, bool]]] = [None] * n_det
-        det_viewpoints: List[str] = ["SIDE"] * n_det
-        det_head_clean: List[bool] = [True] * n_det
-        det_torso_colors: List[Optional[np.ndarray]] = [
-            extract_torso_color_recent(frame, boxes[i]) for i in range(n_det)
-        ]
-
-        if biometric_mode and n_det > 0:
-            head_boxes = np.stack(
-                [compute_head_box_above_shoulders(boxes[i], kpts[i], frame.shape[:2]) for i in range(n_det)],
-                axis=0,
-            ).astype(np.float32)
-
-            # Check head-only overlap independently of lower-body counter/crowd occlusion:
-            # even when lower body is DEPTH-OCCLUDED behind a counter, a clear head (head_iou < 0.25)
-            # still feeds head/hair, skin tone, and ArcFace into Pass-2 biometric profiles!
-            for i in range(n_det):
-                max_h_iou = 0.0
-                for j in range(n_det):
-                    if i == j:
-                        continue
-                    h_ov = _box_iou_single(head_boxes[i], head_boxes[j])
-                    if h_ov > max_h_iou:
-                        max_h_iou = h_ov
-                det_head_clean[i] = max_h_iou < 0.25
-
-            head_embs, gray_embs = encoder.extract_biometric_dino(frame, boxes, head_boxes, frame_gpu=frame_gpu)
-            run_face_now = (
-                face_analyzer is not None
-                and face_analyzer.available
-                and ((frame_count - 1) % max(1, face_stride) == 0)
+            boxes, scores, cls_ids, kpts = detector.detect(frame)
+            n_det = len(boxes)
+            raw_detections_per_frame.append(
+                [(boxes[i].copy(), float(scores[i]), int(cls_ids[i])) for i in range(n_det)]
             )
 
-            fused_list: List[np.ndarray] = []
-            for i in range(n_det):
-                raw_r, valid_r, body_vec = extract_body_shape_vector(boxes[i], kpts[i], conf_thresh=0.40)
-                skin_vec, med_ab, valid_skin = extract_skin_chroma_vector(frame, boxes[i], kpts[i], conf_thresh=0.40)
-                bio_emb = build_clothes_invariant_embedding(head_embs[i], gray_embs[i], body_vec, skin_vec)
-                fused_list.append(bio_emb)
-
-                det_head_embs[i] = head_embs[i]
-                det_gray_embs[i] = gray_embs[i]
-                det_body_ratios[i] = (raw_r, valid_r)
-                det_skin_obs[i] = (skin_vec, med_ab, valid_skin)
-
-                face_found = False
-                if run_face_now and face_analyzer is not None:
-                    f_res = face_analyzer.extract_from_head_box(frame, head_boxes[i])
-                    if f_res is not None:
-                        det_face_obs[i] = f_res
-                        face_found = True
-                        faces_extracted_total += 1
-
-                det_viewpoints[i] = classify_viewpoint(kpts[i], face_detected=face_found)
-
-            embeddings = np.stack(fused_list, axis=0).astype(np.float32)
-        else:
-            embeddings = encoder.extract_standard(frame, boxes, frame_gpu=frame_gpu)
-            for i in range(n_det):
-                det_viewpoints[i] = classify_viewpoint(kpts[i], face_detected=False)
-
-        detections: List[Detection] = []
-        for i in range(n_det):
-            d_val = extract_box_depth(last_depth_map, boxes[i], frame.shape[:2])
-            detections.append(
-                Detection(
-                    box=boxes[i],
-                    score=float(scores[i]),
-                    class_id=int(cls_ids[i]),
-                    embedding=embeddings[i],
-                    depth=d_val,
-                )
-            )
-
-        result = tracker.update(frame, detections, depth_map=last_depth_map, cmc_result=cmc_res)
-        dt = max(1e-4, time.perf_counter() - t0)
-        fps_ema = 0.85 * fps_ema + 0.15 * (1.0 / dt)
-
-        # Snapshot active tracks + update per-track biometric profiles
-        active_snaps: List[TrackBoxSnapshot] = []
-        for tr in result.active_tracks:
-            track_frames.setdefault(tr.track_id, set()).add(frame_count)
-            track_class[tr.track_id] = tr.class_id
-            prof = track_profiles.setdefault(tr.track_id, TrackBiometricProfile())
-
-            tr_kpts: Optional[np.ndarray] = None
-            if tr.time_since_update == 0 and n_det > 0:
-                mi = _match_box_to_detection(tr.current_box(), boxes)
-                if mi is not None:
-                    tr_kpts = kpts[mi].copy()
-                    # Prevent head biometric starvation behind counters: store head/hair, skin, and
-                    # ArcFace whenever the head box itself is unoccluded (head_iou < 0.25), even if
-                    # lower body is DEPTH-OCCLUDED behind a counter.
-                    head_ok = det_head_clean[mi]
-                    prof.add_observation(
-                        frame_idx=frame_count,
-                        conf=float(scores[mi]),
-                        box=boxes[mi],
-                        fused_emb=embeddings[mi],
-                        head_hair_emb=det_head_embs[mi] if head_ok else None,
-                        gray_contour_emb=det_gray_embs[mi] if (not tr.is_depth_occluded) else None,
-                        face_obs=det_face_obs[mi] if head_ok else None,
-                        body_ratios=det_body_ratios[mi],
-                        skin_obs=det_skin_obs[mi] if head_ok else None,
-                        viewpoint=det_viewpoints[mi],
-                        torso_color=det_torso_colors[mi],
-                    )
-
-            active_snaps.append(
-                TrackBoxSnapshot(
-                    track_id=tr.track_id,
-                    box=tr.current_box().copy(),
-                    score=float(tr.score),
-                    depth_ema=float(tr.depth_ema),
-                    time_since_update=int(tr.time_since_update),
-                    is_occluded=bool(tr.is_occluded),
-                    is_depth_occluded=bool(tr.is_depth_occluded or tr.status == "DEPTH-OCCLUDED"),
-                    occluder_id=tr.occluder_id,
-                    last_clean_reason=str(tr.last_clean_reason),
-                    stitched_count=int(tr.stitched_count),
-                    vault_len=len(tr.vault),
-                    vault_max=int(tr.vault.max_entries),
-                    keypoints=tr_kpts,
-                    has_face_lock=len(prof.face_gallery) > 0,
-                )
-            )
-
-        # Snapshot probationary tracks + capture their biometric profiles
-        prob_snaps: List[ProbBoxSnapshot] = []
-        for pr in result.probationary_tracks:
-            prob_frames.setdefault(pr.prob_id, set()).add(frame_count)
-            pprof = prob_profiles.setdefault(pr.prob_id, TrackBiometricProfile())
-            pr_kpts: Optional[np.ndarray] = None
-            if pr.time_since_update == 0 and n_det > 0:
-                mi = _match_box_to_detection(pr.current_box(), boxes)
-                if mi is not None:
-                    pr_kpts = kpts[mi].copy()
-                    head_ok = det_head_clean[mi]
-                    pprof.add_observation(
-                        frame_idx=frame_count,
-                        conf=float(scores[mi]),
-                        box=boxes[mi],
-                        fused_emb=embeddings[mi],
-                        head_hair_emb=det_head_embs[mi] if head_ok else None,
-                        gray_contour_emb=det_gray_embs[mi],
-                        face_obs=det_face_obs[mi] if head_ok else None,
-                        body_ratios=det_body_ratios[mi],
-                        skin_obs=det_skin_obs[mi] if head_ok else None,
-                        viewpoint=det_viewpoints[mi],
-                        torso_color=det_torso_colors[mi],
-                    )
-
-            prob_snaps.append(
-                ProbBoxSnapshot(
-                    prob_id=pr.prob_id,
-                    box=pr.current_box().copy(),
-                    hits=int(pr.hits),
-                    depth_ema=float(pr.depth_ema),
-                    last_veto_reason=pr.last_veto_reason,
-                    keypoints=pr_kpts,
-                )
-            )
-
-        frame_events: List[Dict[str, Any]] = []
-        for ev in result.events:
-            rec = {
-                "frame": ev.frame_idx,
-                "event_type": ev.event_type,
-                "track_id": ev.track_id,
-                "message": ev.message,
-                "details": ev.details,
-            }
-            frame_events.append(rec)
-
-            if ev.event_type == "STITCH_COMMIT":
-                pid = ev.details.get("prob_id")
-                if pid is not None:
-                    pid_int = int(pid)
-                    stitch_prob_to_target[pid_int] = int(ev.track_id)
-                    if pid_int in prob_profiles:
-                        track_profiles.setdefault(int(ev.track_id), TrackBiometricProfile()).merge_from(
-                            prob_profiles[pid_int]
-                        )
-                ghost_age = int(ev.details.get("ghost_age", 0))
-                pass1_recoveries.append(
-                    {
-                        "Frame": ev.frame_idx,
-                        "Recovery Type": "Pass 1: STITCH_COMMIT",
-                        "Recovered ID": f"#{ev.track_id}",
-                        "Biometric Cue": (
-                            "Head/Hair + Body Shape + Skin Tone" if biometric_mode else "Appearance + Clothing"
-                        ),
-                        "Source": f"Prob P{pid}" if pid is not None else "Ghost",
-                        "Occlusion Frames": ghost_age,
-                        "Occlusion Sec": round(ghost_age / max(1.0, src_fps), 2),
-                        "Best Similarity": round(float(ev.details.get("best_sim", 0.0)), 3),
-                        "2nd Best Sim": round(float(ev.details.get("second_best_sim", 0.0)), 3),
-                        "Margin": round(float(ev.details.get("margin", 0.0)), 3),
-                        "Summary": ev.message,
-                    }
-                )
-            elif ev.event_type in ("NEW_TRACK", "NEW_ID_AFTER_VETO"):
-                pid = ev.details.get("prob_id")
-                if pid is not None:
-                    pid_int = int(pid)
-                    new_track_prob_to_id[pid_int] = int(ev.track_id)
-                    if pid_int in prob_profiles:
-                        track_profiles.setdefault(int(ev.track_id), TrackBiometricProfile()).merge_from(
-                            prob_profiles[pid_int]
-                        )
-
-        timeline.append(
-            FrameSnapshot(
+            per_det_max_iou, max_pair_iou = _compute_pairwise_max_ious(boxes)
+            run_depth_now = _should_run_depth_frame(
                 frame_idx=frame_count,
-                detections_count=len(detections),
-                cmc_dx=float(result.cmc.dx),
-                cmc_dy=float(result.cmc.dy),
-                cmc_dtheta=float(result.cmc.dtheta_deg),
-                cmc_inlier_ratio=float(result.cmc.inlier_ratio),
-                cmc_fallback=bool(result.cmc.used_fallback),
-                active=active_snaps,
-                probationary=prob_snaps,
-                ghost_count=len(result.ghosts),
-                events=frame_events,
+                last_depth_map=last_depth_map,
+                max_pair_iou=max_pair_iou,
+                depth_stride=depth_stride,
+                turbo_gpu=turbo_gpu,
             )
-        )
 
-        now_tick = time.perf_counter()
-        if frame_count % 5 == 0 or frame_count == 1 or frame_count >= total_frames or (now_tick - last_ui_tick) >= 1.5:
-            last_ui_tick = now_tick
-            frac = min(0.72, 0.04 + 0.68 * (frame_count / float(total_frames)))
-            progress_bar.progress(frac)
-            st_counts = result.stats
-            face_stat = f" &nbsp;|&nbsp; **Faces Captured:** `{faces_extracted_total}`" if biometric_mode else ""
-            status_placeholder.markdown(
-                f"**[Pass 1 / 2 — Biometric Tracking] Frame `{frame_count}` / `{total_frames}`** &nbsp;|&nbsp; "
-                f"**Live FPS:** `{fps_ema:.1f}` &nbsp;|&nbsp; "
-                f"**Active:** `{st_counts['active_count']}` &nbsp;|&nbsp; "
-                f"**Ghosts:** `{st_counts['ghost_count']}` &nbsp;|&nbsp; "
-                f"**Pass-1 Stitches:** `{st_counts['stitches']}`{face_stat}"
+            # Match current detections to previous frame's active tracks for Smart Keyframe Gating
+            det_prev_entry: List[Optional[Dict[str, Any]]] = [None] * n_det
+            det_prev_iou: List[float] = [0.0] * n_det
+            if turbo_gpu and n_det > 0 and prev_active_cache:
+                for i in range(n_det):
+                    ent, ov = _match_det_to_prev_cache(boxes[i], prev_active_cache)
+                    det_prev_entry[i] = ent
+                    det_prev_iou[i] = ov
+
+            # Determine which detections need a fresh DINOv2 forward pass on this frame
+            need_dino_indices: List[int] = []
+            for i in range(n_det):
+                ent = det_prev_entry[i]
+                can_reuse = False
+                if ent is not None:
+                    has_cached = (
+                        (ent.get("head_emb") is not None and ent.get("gray_emb") is not None)
+                        if biometric_mode
+                        else (ent.get("std_emb") is not None)
+                    )
+                    if has_cached and not _should_run_dino_for_det(
+                        frame_idx=frame_count,
+                        max_det_iou=float(per_det_max_iou[i]),
+                        matched_prev_iou=det_prev_iou[i],
+                        matched_is_occluded=bool(ent.get("is_occluded", False)),
+                        matched_gallery_count=int(ent.get("gallery_count", 0)),
+                        turbo_gpu=turbo_gpu,
+                    ):
+                        can_reuse = True
+                if can_reuse:
+                    dino_skips_total += 1
+                else:
+                    need_dino_indices.append(i)
+                    dino_runs_total += 1
+
+            # Upload full frame to GPU only if Depth or at least one DINOv2 crop needs it
+            need_gpu_upload = use_gpu_frame and (run_depth_now or len(need_dino_indices) > 0)
+            frame_gpu = upload_frame_gpu(frame, device) if need_gpu_upload else None
+
+            cmc_res = None
+            if run_depth_now:
+                depth_runs_total += 1
+                if use_cuda_amp:
+                    with torch_mod.amp.autocast("cuda", dtype=torch_mod.float16):
+                        last_depth_map = depth_est.predict(frame, frame_gpu=frame_gpu)
+                else:
+                    last_depth_map = depth_est.predict(frame, frame_gpu=frame_gpu)
+            else:
+                depth_skips_total += 1
+                cmc_res = tracker.cmc.update(frame, boxes)
+                last_depth_map = warp_depth_map(last_depth_map, cmc_res.matrix, frame.shape[:2])
+
+            det_head_embs: List[Optional[np.ndarray]] = [None] * n_det
+            det_gray_embs: List[Optional[np.ndarray]] = [None] * n_det
+            det_face_obs: List[Optional[Tuple[np.ndarray, float]]] = [None] * n_det
+            det_body_ratios: List[Optional[Tuple[np.ndarray, np.ndarray]]] = [None] * n_det
+            det_skin_obs: List[Optional[Tuple[np.ndarray, np.ndarray, bool]]] = [None] * n_det
+            det_viewpoints: List[str] = ["SIDE"] * n_det
+            det_head_clean: List[bool] = [True] * n_det
+            det_torso_colors: List[Optional[np.ndarray]] = [
+                extract_torso_color_recent(frame, boxes[i]) for i in range(n_det)
+            ]
+
+            if biometric_mode and n_det > 0:
+                head_boxes = np.stack(
+                    [compute_head_box_above_shoulders(boxes[i], kpts[i], frame.shape[:2]) for i in range(n_det)],
+                    axis=0,
+                ).astype(np.float32)
+
+                # Check head-only overlap independently of lower-body counter/crowd occlusion:
+                # even when lower body is DEPTH-OCCLUDED behind a counter, a clear head (head_iou < 0.25)
+                # still feeds head/hair, skin tone, and ArcFace into Pass-2 biometric profiles!
+                for i in range(n_det):
+                    max_h_iou = 0.0
+                    for j in range(n_det):
+                        if i == j:
+                            continue
+                        h_ov = _box_iou_single(head_boxes[i], head_boxes[j])
+                        if h_ov > max_h_iou:
+                            max_h_iou = h_ov
+                    det_head_clean[i] = max_h_iou < 0.25
+
+                # Optional Mask-Clean background neutralization before DINO & skin chroma extraction
+                bio_frame = frame
+                bio_frame_gpu = frame_gpu
+                if mask_cleaner is not None and mask_cleaner.available and need_dino_indices:
+                    cleaned_fr, matched_cnt = mask_cleaner.build_mask_cleaned_frame(frame, boxes)
+                    if matched_cnt > 0:
+                        bio_frame = cleaned_fr
+                        bio_frame_gpu = upload_frame_gpu(bio_frame, device) if use_gpu_frame else None
+
+                # Single-Batch DINOv2/DINOv3 forward pass ONLY for detections requiring fresh embeddings
+                head_embs_list: List[Optional[np.ndarray]] = [None] * n_det
+                gray_embs_list: List[Optional[np.ndarray]] = [None] * n_det
+                if need_dino_indices:
+                    sub_idx = np.asarray(need_dino_indices, dtype=np.int64)
+                    sub_head, sub_gray = encoder.extract_biometric_dino(
+                        bio_frame, boxes[sub_idx], head_boxes[sub_idx], frame_gpu=bio_frame_gpu
+                    )
+                    for k_pos, det_i in enumerate(need_dino_indices):
+                        head_embs_list[det_i] = sub_head[k_pos]
+                        gray_embs_list[det_i] = sub_gray[k_pos]
+                for i in range(n_det):
+                    if head_embs_list[i] is None:
+                        ent = det_prev_entry[i]
+                        assert ent is not None
+                        head_embs_list[i] = ent["head_emb"]
+                        gray_embs_list[i] = ent["gray_emb"]
+
+                face_ready = face_analyzer is not None and face_analyzer.available
+                fused_list: List[np.ndarray] = []
+                for i in range(n_det):
+                    h_emb_i = head_embs_list[i]
+                    g_emb_i = gray_embs_list[i]
+                    assert h_emb_i is not None and g_emb_i is not None
+                    raw_r, valid_r, body_vec = extract_body_shape_vector(boxes[i], kpts[i], conf_thresh=0.40)
+                    skin_vec, med_ab, valid_skin = extract_skin_chroma_vector(bio_frame, boxes[i], kpts[i], conf_thresh=0.40)
+                    bio_emb = build_clothes_invariant_embedding(h_emb_i, g_emb_i, body_vec, skin_vec)
+                    fused_list.append(bio_emb)
+
+                    det_head_embs[i] = h_emb_i
+                    det_gray_embs[i] = g_emb_i
+                    det_body_ratios[i] = (raw_r, valid_r)
+                    det_skin_obs[i] = (skin_vec, med_ab, valid_skin)
+
+                    pre_vp = classify_viewpoint(kpts[i], face_detected=False)
+                    ent_i = det_prev_entry[i]
+                    matched_faces = (
+                        int(ent_i.get("face_count", 0))
+                        if (ent_i is not None and det_prev_iou[i] >= 0.50)
+                        else 0
+                    )
+                    face_found = False
+                    if face_ready and face_analyzer is not None:
+                        if _should_run_arcface_for_det(
+                            frame_idx=frame_count,
+                            pre_viewpoint=pre_vp,
+                            matched_face_count=matched_faces,
+                            face_stride=face_stride,
+                            turbo_gpu=turbo_gpu,
+                        ):
+                            f_res = face_analyzer.extract_from_head_box(frame, head_boxes[i])
+                            if f_res is not None:
+                                det_face_obs[i] = f_res
+                                face_found = True
+                                faces_extracted_total += 1
+                        else:
+                            face_skips_total += 1
+
+                    det_viewpoints[i] = "FRONT" if face_found else pre_vp
+
+                embeddings = np.stack(fused_list, axis=0).astype(np.float32)
+            elif n_det > 0:
+                if len(need_dino_indices) == n_det:
+                    embeddings = encoder.extract_standard(frame, boxes, frame_gpu=frame_gpu)
+                else:
+                    std_list: List[Optional[np.ndarray]] = [None] * n_det
+                    if need_dino_indices:
+                        sub_idx = np.asarray(need_dino_indices, dtype=np.int64)
+                        sub_embs = encoder.extract_standard(frame, boxes[sub_idx], frame_gpu=frame_gpu)
+                        for k_pos, det_i in enumerate(need_dino_indices):
+                            std_list[det_i] = sub_embs[k_pos]
+                    for i in range(n_det):
+                        if std_list[i] is None:
+                            ent = det_prev_entry[i]
+                            assert ent is not None
+                            std_list[i] = ent["std_emb"]
+                    embeddings = np.stack([e for e in std_list if e is not None], axis=0).astype(np.float32)
+                for i in range(n_det):
+                    det_viewpoints[i] = classify_viewpoint(kpts[i], face_detected=False)
+            else:
+                embeddings = np.zeros((0, 1), dtype=np.float32)
+
+            detections: List[Detection] = []
+            for i in range(n_det):
+                d_val = extract_box_depth(last_depth_map, boxes[i], frame.shape[:2])
+                detections.append(
+                    Detection(
+                        box=boxes[i],
+                        score=float(scores[i]),
+                        class_id=int(cls_ids[i]),
+                        embedding=embeddings[i],
+                        depth=d_val,
+                    )
+                )
+
+            result = tracker.update(frame, detections, depth_map=last_depth_map, cmc_result=cmc_res)
+            dt = max(1e-4, time.perf_counter() - t0)
+            fps_ema = 0.85 * fps_ema + 0.15 * (1.0 / dt)
+
+            # Snapshot active tracks + update per-track biometric profiles & Smart Gating cache
+            active_snaps: List[TrackBoxSnapshot] = []
+            next_active_cache: Dict[int, Dict[str, Any]] = {}
+            for tr in result.active_tracks:
+                track_frames.setdefault(tr.track_id, set()).add(frame_count)
+                track_class[tr.track_id] = tr.class_id
+                prof = track_profiles.setdefault(tr.track_id, TrackBiometricProfile())
+
+                tr_kpts: Optional[np.ndarray] = None
+                cached_head: Optional[np.ndarray] = None
+                cached_gray: Optional[np.ndarray] = None
+                cached_std: Optional[np.ndarray] = None
+                if tr.time_since_update == 0 and n_det > 0:
+                    mi = _match_box_to_detection(tr.current_box(), boxes)
+                    if mi is not None:
+                        tr_kpts = kpts[mi].copy()
+                        cached_head = det_head_embs[mi]
+                        cached_gray = det_gray_embs[mi]
+                        cached_std = embeddings[mi] if not biometric_mode else None
+                        # Prevent head biometric starvation behind counters: store head/hair, skin, and
+                        # ArcFace whenever the head box itself is unoccluded (head_iou < 0.25), even if
+                        # lower body is DEPTH-OCCLUDED behind a counter.
+                        head_ok = det_head_clean[mi]
+                        prof.add_observation(
+                            frame_idx=frame_count,
+                            conf=float(scores[mi]),
+                            box=boxes[mi],
+                            fused_emb=embeddings[mi],
+                            head_hair_emb=det_head_embs[mi] if head_ok else None,
+                            gray_contour_emb=det_gray_embs[mi] if (not tr.is_depth_occluded) else None,
+                            face_obs=det_face_obs[mi] if head_ok else None,
+                            body_ratios=det_body_ratios[mi],
+                            skin_obs=det_skin_obs[mi] if head_ok else None,
+                            viewpoint=det_viewpoints[mi],
+                            torso_color=det_torso_colors[mi],
+                        )
+
+                prev_tr_ent = prev_active_cache.get(tr.track_id)
+                next_active_cache[tr.track_id] = {
+                    "box": tr.current_box().copy(),
+                    "head_emb": cached_head if cached_head is not None else (prev_tr_ent["head_emb"] if prev_tr_ent else None),
+                    "gray_emb": cached_gray if cached_gray is not None else (prev_tr_ent["gray_emb"] if prev_tr_ent else None),
+                    "std_emb": cached_std if cached_std is not None else (prev_tr_ent["std_emb"] if prev_tr_ent else None),
+                    "is_occluded": bool(tr.is_occluded or tr.is_depth_occluded or tr.status == "DEPTH-OCCLUDED"),
+                    "gallery_count": len(prof.best_fused_gallery),
+                    "face_count": len(prof.face_gallery),
+                }
+
+                active_snaps.append(
+                    TrackBoxSnapshot(
+                        track_id=tr.track_id,
+                        box=tr.current_box().copy(),
+                        score=float(tr.score),
+                        depth_ema=float(tr.depth_ema),
+                        time_since_update=int(tr.time_since_update),
+                        is_occluded=bool(tr.is_occluded),
+                        is_depth_occluded=bool(tr.is_depth_occluded or tr.status == "DEPTH-OCCLUDED"),
+                        occluder_id=tr.occluder_id,
+                        last_clean_reason=str(tr.last_clean_reason),
+                        stitched_count=int(tr.stitched_count),
+                        vault_len=len(tr.vault),
+                        vault_max=int(tr.vault.max_entries),
+                        keypoints=tr_kpts,
+                        has_face_lock=len(prof.face_gallery) > 0,
+                    )
+                )
+            prev_active_cache = next_active_cache
+
+            # Snapshot probationary tracks + capture their biometric profiles
+            prob_snaps: List[ProbBoxSnapshot] = []
+            for pr in result.probationary_tracks:
+                prob_frames.setdefault(pr.prob_id, set()).add(frame_count)
+                pprof = prob_profiles.setdefault(pr.prob_id, TrackBiometricProfile())
+                pr_kpts: Optional[np.ndarray] = None
+                if pr.time_since_update == 0 and n_det > 0:
+                    mi = _match_box_to_detection(pr.current_box(), boxes)
+                    if mi is not None:
+                        pr_kpts = kpts[mi].copy()
+                        head_ok = det_head_clean[mi]
+                        pprof.add_observation(
+                            frame_idx=frame_count,
+                            conf=float(scores[mi]),
+                            box=boxes[mi],
+                            fused_emb=embeddings[mi],
+                            head_hair_emb=det_head_embs[mi] if head_ok else None,
+                            gray_contour_emb=det_gray_embs[mi],
+                            face_obs=det_face_obs[mi] if head_ok else None,
+                            body_ratios=det_body_ratios[mi],
+                            skin_obs=det_skin_obs[mi] if head_ok else None,
+                            viewpoint=det_viewpoints[mi],
+                            torso_color=det_torso_colors[mi],
+                        )
+
+                prob_snaps.append(
+                    ProbBoxSnapshot(
+                        prob_id=pr.prob_id,
+                        box=pr.current_box().copy(),
+                        hits=int(pr.hits),
+                        depth_ema=float(pr.depth_ema),
+                        last_veto_reason=pr.last_veto_reason,
+                        keypoints=pr_kpts,
+                    )
+                )
+
+            frame_events: List[Dict[str, Any]] = []
+            for ev in result.events:
+                rec = {
+                    "frame": ev.frame_idx,
+                    "event_type": ev.event_type,
+                    "track_id": ev.track_id,
+                    "message": ev.message,
+                    "details": ev.details,
+                }
+                frame_events.append(rec)
+
+                if ev.event_type == "STITCH_COMMIT":
+                    pid = ev.details.get("prob_id")
+                    if pid is not None:
+                        pid_int = int(pid)
+                        stitch_prob_to_target[pid_int] = int(ev.track_id)
+                        if pid_int in prob_profiles:
+                            track_profiles.setdefault(int(ev.track_id), TrackBiometricProfile()).merge_from(
+                                prob_profiles[pid_int]
+                            )
+                    ghost_age = int(ev.details.get("ghost_age", 0))
+                    pass1_recoveries.append(
+                        {
+                            "Frame": ev.frame_idx,
+                            "Recovery Type": "Pass 1: STITCH_COMMIT",
+                            "Recovered ID": f"#{ev.track_id}",
+                            "Biometric Cue": (
+                                "Head/Hair + Body Shape + Skin Tone" if biometric_mode else "Appearance + Clothing"
+                            ),
+                            "Source": f"Prob P{pid}" if pid is not None else "Ghost",
+                            "Occlusion Frames": ghost_age,
+                            "Occlusion Sec": round(ghost_age / max(1.0, src_fps), 2),
+                            "Best Similarity": round(float(ev.details.get("best_sim", 0.0)), 3),
+                            "2nd Best Sim": round(float(ev.details.get("second_best_sim", 0.0)), 3),
+                            "Margin": round(float(ev.details.get("margin", 0.0)), 3),
+                            "Summary": ev.message,
+                        }
+                    )
+                elif ev.event_type in ("NEW_TRACK", "NEW_ID_AFTER_VETO"):
+                    pid = ev.details.get("prob_id")
+                    if pid is not None:
+                        pid_int = int(pid)
+                        new_track_prob_to_id[pid_int] = int(ev.track_id)
+                        if pid_int in prob_profiles:
+                            track_profiles.setdefault(int(ev.track_id), TrackBiometricProfile()).merge_from(
+                                prob_profiles[pid_int]
+                            )
+
+            timeline.append(
+                FrameSnapshot(
+                    frame_idx=frame_count,
+                    detections_count=len(detections),
+                    cmc_dx=float(result.cmc.dx),
+                    cmc_dy=float(result.cmc.dy),
+                    cmc_dtheta=float(result.cmc.dtheta_deg),
+                    cmc_inlier_ratio=float(result.cmc.inlier_ratio),
+                    cmc_fallback=bool(result.cmc.used_fallback),
+                    active=active_snaps,
+                    probationary=prob_snaps,
+                    ghost_count=len(result.ghosts),
+                    events=frame_events,
+                )
             )
+
+            now_tick = time.perf_counter()
+            if frame_count == 1 and stepper_placeholder is not None:
+                stepper_placeholder.markdown(_render_pipeline_stepper(2), unsafe_allow_html=True)
+            if frame_count % 5 == 0 or frame_count == 1 or frame_count >= total_frames or (now_tick - last_ui_tick) >= 1.5:
+                last_ui_tick = now_tick
+                frac = min(0.72, 0.04 + 0.68 * (frame_count / float(total_frames)))
+                progress_bar.progress(frac)
+                st_counts = result.stats
+                face_stat = f" &nbsp;|&nbsp; **Faces Captured:** `{faces_extracted_total}`" if biometric_mode else ""
+                turbo_stat = " &nbsp;|&nbsp; **Mode:** `TURBO FP16`" if turbo_gpu else ""
+                status_placeholder.markdown(
+                    f"**[Pass 1 / 2 — Biometric Tracking] Frame `{frame_count}` / `{total_frames}`** &nbsp;|&nbsp; "
+                    f"**Live FPS:** `{fps_ema:.1f}` &nbsp;|&nbsp; "
+                    f"**Active:** `{st_counts['active_count']}` &nbsp;|&nbsp; "
+                    f"**Ghosts:** `{st_counts['ghost_count']}` &nbsp;|&nbsp; "
+                    f"**Pass-1 Stitches:** `{st_counts['stitches']}`{face_stat}{turbo_stat}"
+                )
 
     cap.release()
     t_pass1 = max(1e-3, time.perf_counter() - t_start)
@@ -2882,6 +3400,8 @@ def run_two_pass_biometric_job(
     # =======================================================================
     # ZERO-OVERHEAD STANDARD BASELINE TRACKER (Pure IoU + 15f Coasting)
     # =======================================================================
+    if stepper_placeholder is not None:
+        stepper_placeholder.markdown(_render_pipeline_stepper(3), unsafe_allow_html=True)
     progress_bar.progress(0.73)
     status_placeholder.markdown(
         "**[Baseline Benchmark]** Running zero-overhead Standard IoU Baseline tracker on Pass-1 detections..."
@@ -2957,6 +3477,41 @@ def run_two_pass_biometric_job(
         src_fps=src_fps,
     )
 
+    # Zero-cost Pose Behavior & Fall Detection over consolidated timeline
+    pose_result: Optional[Dict[str, Any]] = None
+    if enable_pose_behavior and consolidated_timeline:
+        pose_result = PoseBehaviorAnalyzer(smooth_window=5).analyze_timeline(
+            consolidated_timeline, src_fps=src_fps
+        )
+    pose_frame_labels: Dict[int, Dict[int, str]] = (
+        pose_result.get("frame_labels", {}) if pose_result is not None else {}
+    )
+
+    # Cross-video Biometric Vault matching (lookup before rendering so named labels appear in Pass-2 video)
+    vault_matches: Dict[int, Dict[str, Any]] = {}
+    vault_names_for_hud: Dict[int, str] = {}
+    if match_vault and biometric_mode and seq_profiles:
+        try:
+            vault = get_biometric_vault()
+            vault_all = {item["vault_id"]: item for item in vault.list_identities(include_sightings=False)}
+            for seq_id in sorted(seq_profiles.keys()):
+                matched = vault.match_track_to_vault(seq_profiles[seq_id], face_thresh=0.42, bio_thresh=0.70)
+                if matched is not None:
+                    v_id, v_name, v_conf, v_cue = matched
+                    v_rec = vault_all.get(v_id, {})
+                    is_wl = bool(v_rec.get("is_watchlist", False))
+                    vault_matches[seq_id] = {
+                        "vault_id": v_id,
+                        "display_name": v_name,
+                        "is_watchlist": is_wl,
+                        "confidence": v_conf,
+                        "cue": v_cue,
+                    }
+                    if v_name:
+                        vault_names_for_hud[seq_id] = f"[{v_name}]"
+        except Exception:
+            pass
+
     with open(events_path, "w", encoding="utf-8") as log_file:
         for snap in consolidated_timeline:
             for ev in snap.events:
@@ -2965,19 +3520,18 @@ def run_two_pass_biometric_job(
     # =======================================================================
     # PASS 2 RENDER: Stream Consolidated Sequential IDs to Even-Dim H.264 + Capture Thumbnails
     # =======================================================================
+    if stepper_placeholder is not None:
+        stepper_placeholder.markdown(_render_pipeline_stepper(4), unsafe_allow_html=True)
     cap2 = cv2.VideoCapture(str(input_path))
     if not cap2.isOpened():
         raise RuntimeError(f"Could not reopen uploaded video for Pass 2 render: {input_path}")
 
     even_w, even_h = _even_dims(width, height)
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = AsyncVideoWriter(
+    writer = FastH264VideoWriter(
         str(output_path),
-        fourcc,
-        src_fps,
-        (even_w, even_h),
+        fps=src_fps,
+        frame_size=(even_w, even_h),
         max_queue=32,
-        transcode_h264=True,
     )
     renderer = Pass2OverlayRenderer(
         probation_frames=tracker_cfg.probation_frames,
@@ -2986,7 +3540,7 @@ def run_two_pass_biometric_job(
     )
     mode_tag = "BIOMETRIC (0% Clothing)" if biometric_mode else "STANDARD"
     face_tag = "ArcFace" if (face_analyzer is not None and face_analyzer.available) else "Head/Body/Skin"
-    backend_info = f"{mode_tag} | {Path(detector_weights).stem} | {encoder.backbone_name} + {face_tag}"
+    backend_info = f"{mode_tag} | {Path(getattr(detector, 'model_name', detector_weights)).stem} | {encoder.backbone_name} + {face_tag}"
 
     person_thumbnails: Dict[int, bytes] = {}
     best_thumb_rank: Dict[int, float] = {}
@@ -2998,7 +3552,7 @@ def run_two_pass_biometric_job(
         if not ok:
             break
 
-        # Capture best unoccluded high-confidence crop per sequential ID BEFORE drawing boxes
+        # Capture best unoccluded high-confidence crop per sequential ID BEFORE drawing boxes/blur
         for tr in snap.active:
             bw = max(1.0, float(tr.box[2] - tr.box[0]))
             bh = max(1.0, float(tr.box[3] - tr.box[1]))
@@ -3017,6 +3571,10 @@ def run_two_pass_biometric_job(
             pass2_face_locks=pass2_face_locks,
             pass2_bio_merges=pass2_bio_merges,
             backend_info=backend_info,
+            vault_names=vault_names_for_hud,
+            behavior_labels=pose_frame_labels.get(snap.frame_idx, {}),
+            privacy_mode=privacy_mode,
+            privacy_style=privacy_style,
         )
         writer.write(_ensure_even_frame(vis, even_w, even_h))
         rendered_frames = idx
@@ -3038,7 +3596,40 @@ def run_two_pass_biometric_job(
         "**Finalizing browser-playable H.264 (`avc1` / `yuv420p`) video via `imageio-ffmpeg`...**"
     )
     _close_writer_with_keepalive(writer, progress_bar, status_placeholder)
+
+    # Persist matched/new confirmed sightings into the SQLite Biometric Vault (with captured portrait thumbnails)
+    if match_vault and biometric_mode and seq_profiles:
+        try:
+            vault = get_biometric_vault()
+            vid_label = input_path.name
+            for seq_id in sorted(seq_profiles.keys()):
+                ps = person_stats.get(seq_id, {})
+                f_sec = round(max(0, int(ps.get("first_frame", 1)) - 1) / max(1.0, src_fps), 2)
+                l_sec = round(max(0, int(ps.get("last_frame", 1)) - 1) / max(1.0, src_fps), 2)
+                existing_m = vault_matches.get(seq_id)
+                vid_out = vault.upsert_track_identity(
+                    track_biometrics=seq_profiles[seq_id],
+                    vault_id=existing_m["vault_id"] if existing_m else None,
+                    video_name=vid_label,
+                    camera_label=camera_label,
+                    first_sec=f_sec,
+                    last_sec=l_sec,
+                    thumbnail_jpeg=person_thumbnails.get(seq_id),
+                )
+                if existing_m is None:
+                    vault_matches[seq_id] = {
+                        "vault_id": vid_out,
+                        "display_name": None,
+                        "is_watchlist": False,
+                        "confidence": 1.0,
+                        "cue": "NEW_VAULT_PROFILE",
+                    }
+        except Exception:
+            pass
+
     progress_bar.progress(1.0)
+    if stepper_placeholder is not None:
+        stepper_placeholder.markdown(_render_pipeline_stepper(5), unsafe_allow_html=True)
 
     total_elapsed = max(1e-3, time.perf_counter() - t_start)
     pass1_fps = frame_count / t_pass1
@@ -3062,13 +3653,20 @@ def run_two_pass_biometric_job(
         "avg_fps": round(overall_fps, 2),
         "device": device,
         "biometric_mode": biometric_mode,
-        "detector_weights": detector_weights,
+        "detector_weights": getattr(detector, "model_name", detector_weights),
         "imgsz": detector.imgsz,
         "reid_backend": encoder.backbone_name,
         "face_backend": face_analyzer.provider_label if face_analyzer is not None else "Disabled",
         "depth_backend": depth_est.backend,
+        "model_notes": model_notes,
         "people_only": people_only or biometric_mode,
         "faces_extracted_total": faces_extracted_total,
+        "turbo_gpu": bool(turbo_gpu),
+        "depth_runs": depth_runs_total,
+        "depth_skips": depth_skips_total,
+        "dino_runs": dino_runs_total,
+        "dino_skips": dino_skips_total,
+        "face_skips": face_skips_total,
         "confirmed_unique_ids": len(final_confirmed_ids),
         "baseline_unique_ids": baseline_unique_ids,
         "pass1_unique_ids": len(track_frames),
@@ -3085,11 +3683,14 @@ def run_two_pass_biometric_job(
         "max_occ_sec": round(max_occ_frames / max(1.0, src_fps), 2),
         "counters": dict(tracker.counters),
         "completed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        # Session-cached Pass-1/Pass-2 state for zero-rerun Tab 2 & Tab 3 rendering
+        # Session-cached Pass-1/Pass-2 state for zero-rerun Tabs 1-6
         "consolidated_timeline": consolidated_timeline,
         "baseline_timeline": baseline_timeline,
         "person_thumbnails": person_thumbnails,
         "person_stats": person_stats,
+        "seq_profiles": seq_profiles,
+        "vault_matches": vault_matches,
+        "pose_result": pose_result,
         "solo_renders": {},
         "comparison_renders": {},
     }
@@ -3297,6 +3898,8 @@ def _build_person_stats_and_fragments(
             "max_gap_sec": round(max_gap / fps_safe, 2),
             "has_face_lock": face_n > 0 or face_lock_flag.get(tid, False),
             "face_samples": face_n,
+            "angles": angles,
+            "angle_code": "/".join(a[0] for a in angles) if angles else "—",
             "recovery_count": rec_count_by_id.get(tid, 0),
             "modalities": ", ".join(mods),
             "baseline_fragment_ids": frag_ids,
@@ -3316,6 +3919,9 @@ def render_single_person_video(
     src_fps: float,
     progress_bar: Any,
     status_placeholder: Any,
+    privacy_mode: str = "Off",
+    privacy_style: str = "Gaussian Blur",
+    target_display_name: Optional[str] = None,
 ) -> Path:
     """Render an on-demand H.264 solo focus video highlighting ONLY `target_id` (zero AI re-run)."""
     cap = cv2.VideoCapture(str(source_video_path))
@@ -3326,14 +3932,11 @@ def render_single_person_video(
     height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     even_w, even_h = _even_dims(width, height)
 
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = AsyncVideoWriter(
+    writer = FastH264VideoWriter(
         str(output_path),
-        fourcc,
-        src_fps,
-        (even_w, even_h),
+        fps=src_fps,
+        frame_size=(even_w, even_h),
         max_queue=32,
-        transcode_h264=True,
     )
 
     # Precompute target lifespan so OCCLUDED / RE-ACQUIRING HUD only appears during active gaps
@@ -3360,11 +3963,24 @@ def render_single_person_video(
 
         target_snap = next((a for a in snap.active if a.track_id == target_id), None)
 
+        # Apply optional selective privacy anonymization before dimming/HUD overlays
+        base_frame = (
+            apply_privacy_blur(
+                frame,
+                snap.active,
+                mode=privacy_mode,
+                style=privacy_style,
+                target_id=target_id,
+            )
+            if (privacy_mode or "Off") != "Off"
+            else frame
+        )
+
         if dim_bg:
             # Darken everything outside the selected person's bounding box by 55%
-            canvas = (frame.astype(np.float32) * 0.45).astype(np.uint8)
+            canvas = (base_frame.astype(np.float32) * 0.45).astype(np.uint8)
             if target_snap is not None:
-                fh, fw = frame.shape[:2]
+                fh, fw = base_frame.shape[:2]
                 bw = max(1.0, float(target_snap.box[2] - target_snap.box[0]))
                 bh = max(1.0, float(target_snap.box[3] - target_snap.box[1]))
                 pad_x, pad_y = int(round(0.08 * bw)), int(round(0.06 * bh))
@@ -3373,9 +3989,9 @@ def render_single_person_video(
                 rx2 = min(fw, int(round(float(target_snap.box[2]))) + pad_x)
                 ry2 = min(fh, int(round(float(target_snap.box[3]))) + pad_y)
                 if rx2 > rx1 and ry2 > ry1:
-                    canvas[ry1:ry2, rx1:rx2] = frame[ry1:ry2, rx1:rx2]
+                    canvas[ry1:ry2, rx1:rx2] = base_frame[ry1:ry2, rx1:rx2]
         else:
-            canvas = frame
+            canvas = base_frame.copy()
 
         if target_snap is not None:
             last_seen_frame = snap.frame_idx
@@ -3401,7 +4017,8 @@ def render_single_person_video(
                 cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 3, cv2.LINE_AA)
 
             face_tag = " | FACE LOCKED" if target_snap.has_face_lock else ""
-            header = f"TARGET PERSON #{target_id}{face_tag}"
+            name_tag = f" ({target_display_name})" if target_display_name else ""
+            header = f"TARGET PERSON #{target_id}{name_tag}{face_tag}"
             draw_label_pill(canvas, header, (x1, max(24, y1 - 4)), color, (12, 16, 24), font_scale=0.56, thickness=2)
 
             if target_snap.is_depth_occluded:
@@ -3503,14 +4120,11 @@ def render_side_by_side_comparison_video(
     sy = float(panel_h) / float(max(1, src_h))
 
     out_w, out_h = panel_w * 2, panel_h
-    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = AsyncVideoWriter(
+    writer = FastH264VideoWriter(
         str(output_path),
-        fourcc,
-        src_fps,
-        (out_w, out_h),
+        fps=src_fps,
+        frame_size=(out_w, out_h),
         max_queue=32,
-        transcode_h264=True,
     )
 
     seen_base_ids: Set[int] = set()
@@ -3609,7 +4223,7 @@ def render_side_by_side_comparison_video(
 
 
 # ---------------------------------------------------------------------------
-# Dark-Theme Styling & Multi-Tab Streamlit Web App UI
+# Enterprise Command-Center UI, Stepper, Dossier Cards & Interactive Plotly Charts
 # ---------------------------------------------------------------------------
 
 
@@ -3617,100 +4231,322 @@ def _inject_custom_css() -> None:
     st.markdown(
         """
         <style>
-        /* Keep sidebar toggle accessible while hiding Streamlit deploy/footer clutter */
-        .stAppDeployButton, footer, #MainMenu {visibility: hidden !important; display: none !important;}
-        .block-container {padding-top: 1.4rem !important; padding-bottom: 2.5rem !important;}
+        @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600;700&display=swap');
 
-        /* Sleek top hero header bar */
-        .hero-banner {
-            background: linear-gradient(135deg, #111827 0%, #0F172A 60%, #0B192C 100%);
-            border: 1px solid #1F2937;
-            border-radius: 16px;
-            padding: 1.25rem 1.5rem;
-            margin-bottom: 1.25rem;
-            box-shadow: 0 10px 30px rgba(0, 0, 0, 0.35);
+        /* Preserve sidebar toggle while hiding deploy/footer clutter */
+        .stAppDeployButton, footer, #MainMenu {visibility: hidden !important; display: none !important;}
+
+        html, body, [class*="css"] {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
         }
-        .hero-title {
-            font-size: 1.65rem;
+        code, pre, .mono {
+            font-family: 'JetBrains Mono', monospace !important;
+        }
+
+        /* Deep command-center gradient mesh background */
+        .stApp {
+            background-color: #060913 !important;
+            background-image:
+                radial-gradient(ellipse 75% 42% at 22% -6%, rgba(6, 182, 212, 0.14), transparent 62%),
+                radial-gradient(ellipse 65% 38% at 84% -8%, rgba(99, 102, 241, 0.12), transparent 60%);
+            background-attachment: fixed;
+        }
+        section[data-testid="stSidebar"] {
+            background-color: #0D1323 !important;
+            border-right: 1px solid rgba(56, 189, 248, 0.14);
+        }
+        .block-container {
+            padding-top: 1.25rem !important;
+            padding-bottom: 2.5rem !important;
+        }
+
+        /* Pulsing online dot animation */
+        @keyframes pulseDot {
+            0%   { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.75); }
+            70%  { box-shadow: 0 0 0 8px rgba(16, 185, 129, 0.0); }
+            100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.0); }
+        }
+        @keyframes pulseStep {
+            0%, 100% { box-shadow: 0 0 12px rgba(6, 182, 212, 0.35); }
+            50%      { box-shadow: 0 0 22px rgba(6, 182, 212, 0.65); }
+        }
+
+        /* Top Enterprise Command Header */
+        .cmd-header {
+            background: linear-gradient(135deg, rgba(13, 19, 35, 0.92) 0%, rgba(15, 23, 42, 0.84) 60%, rgba(8, 24, 40, 0.88) 100%);
+            border: 1px solid rgba(56, 189, 248, 0.22);
+            border-top: 2px solid #06B6D4;
+            border-radius: 16px;
+            padding: 1.25rem 1.55rem;
+            margin-bottom: 1.2rem;
+            backdrop-filter: blur(12px);
+            box-shadow: 0 14px 36px rgba(0, 0, 0, 0.45);
+        }
+        .cmd-top-row {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.75rem;
+            margin-bottom: 0.4rem;
+        }
+        .cmd-title {
+            font-size: 1.55rem;
             font-weight: 700;
             color: #F8FAFC;
-            margin: 0 0 0.25rem 0;
-            letter-spacing: -0.01em;
+            letter-spacing: -0.02em;
+            margin: 0;
         }
-        .hero-subtitle {
-            font-size: 0.92rem;
+        .cmd-subtitle {
+            font-size: 0.88rem;
             color: #94A3B8;
             margin: 0 0 0.85rem 0;
         }
-        .pill-row {
+        .online-pill {
+            display: inline-flex;
+            align-items: center;
+            gap: 0.5rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.74rem;
+            font-weight: 600;
+            color: #34D399;
+            background: rgba(16, 185, 129, 0.12);
+            border: 1px solid rgba(16, 185, 129, 0.40);
+            padding: 0.30rem 0.80rem;
+            border-radius: 999px;
+            letter-spacing: 0.04em;
+        }
+        .online-dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: #10B981;
+            animation: pulseDot 1.8s infinite;
+        }
+        .badge-row {
             display: flex;
             flex-wrap: wrap;
             gap: 0.45rem;
         }
-        .status-pill {
+        .model-badge {
             display: inline-flex;
             align-items: center;
-            gap: 0.35rem;
-            font-size: 0.76rem;
-            font-weight: 600;
-            color: #E2E8F0;
-            background: rgba(56, 189, 248, 0.10);
-            border: 1px solid rgba(56, 189, 248, 0.30);
-            padding: 0.24rem 0.65rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.73rem;
+            font-weight: 500;
+            color: #CBD5E1;
+            background: rgba(6, 182, 212, 0.10);
+            border: 1px solid rgba(56, 189, 248, 0.28);
+            padding: 0.22rem 0.65rem;
             border-radius: 999px;
         }
-        .status-pill.gpu {
-            color: #34D399;
-            background: rgba(52, 211, 153, 0.12);
-            border-color: rgba(52, 211, 153, 0.35);
-        }
 
-        /* Elevated dark glass KPI metric cards */
+        /* Glassmorphic KPI metric cards with 2px gradient top accent */
         [data-testid="stMetric"] {
-            background: linear-gradient(180deg, #111827 0%, #0F172A 100%);
-            border: 1px solid #1F2937;
-            border-radius: 14px;
-            padding: 0.95rem 1.1rem;
-            box-shadow: 0 6px 18px rgba(0, 0, 0, 0.28);
+            background: rgba(15, 23, 42, 0.72) !important;
+            border: 1px solid rgba(56, 189, 248, 0.18) !important;
+            border-top: 2px solid #06B6D4 !important;
+            border-radius: 14px !important;
+            padding: 0.95rem 1.15rem !important;
+            backdrop-filter: blur(10px);
+            box-shadow: 0 8px 24px rgba(0, 0, 0, 0.32);
         }
         [data-testid="stMetricLabel"] p {
             color: #94A3B8 !important;
-            font-size: 0.82rem !important;
+            font-size: 0.76rem !important;
             font-weight: 600 !important;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
         }
         [data-testid="stMetricValue"] {
+            font-family: 'JetBrains Mono', monospace !important;
             color: #F8FAFC !important;
             font-weight: 700 !important;
+            font-size: 1.65rem !important;
+        }
+        [data-testid="stMetricDelta"] {
+            font-family: 'JetBrains Mono', monospace !important;
+            font-size: 0.75rem !important;
         }
 
-        /* Clean workspace tab bar */
+        /* Sleek Upload Dropzone */
+        [data-testid="stFileUploaderDropzone"] {
+            background: rgba(13, 19, 35, 0.72) !important;
+            border: 1.5px dashed rgba(6, 182, 212, 0.42) !important;
+            border-radius: 14px !important;
+            transition: border-color 0.2s ease, background 0.2s ease;
+        }
+        [data-testid="stFileUploaderDropzone"]:hover {
+            border-color: #06B6D4 !important;
+            background: rgba(6, 182, 212, 0.07) !important;
+        }
+
+        /* Navigation Tabs */
         .stTabs [data-baseweb="tab-list"] {
-            gap: 0.5rem;
-            background-color: #111827;
+            gap: 0.4rem;
+            background: rgba(13, 19, 35, 0.85);
             padding: 0.35rem;
             border-radius: 12px;
-            border: 1px solid #1F2937;
+            border: 1px solid rgba(56, 189, 248, 0.16);
         }
         .stTabs [data-baseweb="tab"] {
             border-radius: 9px;
             padding: 0.55rem 1.05rem;
             font-weight: 600;
+            font-size: 0.86rem;
             color: #94A3B8;
         }
         .stTabs [aria-selected="true"] {
-            background: rgba(56, 189, 248, 0.16) !important;
-            color: #38BDF8 !important;
-            border: 1px solid rgba(56, 189, 248, 0.40) !important;
+            background: linear-gradient(135deg, rgba(6, 182, 212, 0.22), rgba(99, 102, 241, 0.18)) !important;
+            color: #22D3EE !important;
+            border: 1px solid rgba(6, 182, 212, 0.45) !important;
         }
 
-        /* Roster card caption */
-        .roster-card {
-            background: #111827;
-            border: 1px solid #1F2937;
-            border-radius: 12px;
-            padding: 0.55rem;
-            text-align: center;
-            margin-bottom: 0.5rem;
+        /* 4-Stage Pipeline Stepper */
+        .stepper-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 0.65rem;
+            margin: 0.75rem 0 0.65rem 0;
+        }
+        .step-box {
+            border-radius: 11px;
+            padding: 0.60rem 0.75rem;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.76rem;
+            font-weight: 600;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            border: 1px solid rgba(148, 163, 184, 0.18);
+            background: rgba(15, 23, 42, 0.65);
+            color: #64748B;
+        }
+        .step-box.done {
+            border-color: rgba(16, 185, 129, 0.55);
+            background: rgba(16, 185, 129, 0.12);
+            color: #34D399;
+        }
+        .step-box.active {
+            border-color: #06B6D4;
+            background: rgba(6, 182, 212, 0.16);
+            color: #22D3EE;
+            animation: pulseStep 1.6s infinite;
+        }
+
+        /* Dark Cinema Video Bezel Header */
+        .cinema-bar {
+            background: linear-gradient(90deg, #0D1323 0%, #111C33 100%);
+            border: 1px solid rgba(56, 189, 248, 0.22);
+            border-bottom: none;
+            border-radius: 12px 12px 0 0;
+            padding: 0.55rem 0.95rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            margin-top: 0.35rem;
+        }
+        .cinema-title {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.80rem;
+            font-weight: 600;
+            color: #E2E8F0;
+            letter-spacing: 0.03em;
+        }
+        .cinema-meta {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.72rem;
+            color: #38BDF8;
+        }
+
+        /* Biometric Dossier Card + Targeting Reticle Frame */
+        .dossier-card {
+            background: rgba(15, 23, 42, 0.78);
+            border: 1px solid rgba(56, 189, 248, 0.20);
+            border-top: 2px solid #06B6D4;
+            border-radius: 14px;
+            padding: 0.75rem;
+            margin-bottom: 0.85rem;
+            box-shadow: 0 8px 20px rgba(0, 0, 0, 0.30);
+        }
+        .reticle-wrap {
+            position: relative;
+            width: 100%;
+            height: 165px;
+            border-radius: 10px;
+            overflow: hidden;
+            background: #060913;
+            border: 1px solid rgba(6, 182, 212, 0.30);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 0.60rem;
+        }
+        .reticle-wrap img {
+            max-width: 100%;
+            max-height: 100%;
+            object-fit: contain;
+        }
+        .reticle-corner {
+            position: absolute;
+            width: 12px;
+            height: 12px;
+            border-color: #06B6D4;
+            border-style: solid;
+            pointer-events: none;
+        }
+        .rc-tl { top: 6px; left: 6px; border-width: 2px 0 0 2px; }
+        .rc-tr { top: 6px; right: 6px; border-width: 2px 2px 0 0; }
+        .rc-bl { bottom: 6px; left: 6px; border-width: 0 0 2px 2px; }
+        .rc-br { bottom: 6px; right: 6px; border-width: 0 2px 2px 0; }
+
+        .dossier-id {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 1.02rem;
+            font-weight: 700;
+            color: #F8FAFC;
+            margin-bottom: 0.15rem;
+        }
+        .dossier-sub {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.74rem;
+            color: #94A3B8;
+            margin-bottom: 0.45rem;
+        }
+        .mini-badge {
+            display: inline-block;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.66rem;
+            font-weight: 600;
+            padding: 0.15rem 0.45rem;
+            border-radius: 6px;
+            margin-right: 0.25rem;
+            margin-bottom: 0.20rem;
+        }
+        .mb-face { color: #34D399; background: rgba(16, 185, 129, 0.14); border: 1px solid rgba(16, 185, 129, 0.40); }
+        .mb-angle { color: #38BDF8; background: rgba(6, 182, 212, 0.14); border: 1px solid rgba(6, 182, 212, 0.38); }
+        .mb-rec { color: #FBBF24; background: rgba(245, 158, 11, 0.14); border: 1px solid rgba(245, 158, 11, 0.40); }
+
+        /* Enlarged Solo Dossier Header Card */
+        .solo-dossier {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+            background: rgba(15, 23, 42, 0.80);
+            border: 1px solid rgba(56, 189, 248, 0.25);
+            border-left: 3px solid #06B6D4;
+            border-radius: 14px;
+            padding: 0.85rem 1.05rem;
+            margin-bottom: 0.85rem;
+        }
+        .solo-dossier-img {
+            width: 96px;
+            height: 120px;
+            border-radius: 10px;
+            object-fit: cover;
+            border: 1px solid rgba(6, 182, 212, 0.45);
+            background: #060913;
+            flex-shrink: 0;
         }
         </style>
         """,
@@ -3718,26 +4554,52 @@ def _inject_custom_css() -> None:
     )
 
 
-def _render_hero_header(device: str, detector_weights: str, reid_variant: str, biometric_mode: bool) -> None:
-    dev_label = "GPU / CUDA FP16" if device == "cuda" else "CPU Mode"
-    dev_cls = "status-pill gpu" if device == "cuda" else "status-pill"
-    det_label = Path(detector_weights).stem.upper()
-    reid_label = "DINOv2 ViT-B/14" if "vitb14" in reid_variant else "DINOv2 ViT-S/14"
-    face_label = "ArcFace buffalo_l" if biometric_mode else "Standard Mode"
+def _render_command_header(
+    device: str,
+    detector_weights: str,
+    reid_variant: str,
+    biometric_mode: bool,
+    detector_imgsz: int,
+    depth_backend: str = "depth_anything",
+) -> None:
+    dev_str = "SYSTEM ONLINE · CUDA" if device == "cuda" else "SYSTEM ONLINE · CPU"
+    resolved_det, is_trt = _resolve_tensorrt_or_pt(detector_weights)
+    det_label = f"{Path(resolved_det).stem.upper()}{' [TRT]' if is_trt else ''} @{detector_imgsz}"
+    if "dinov3" in reid_variant.lower():
+        reid_label = "DINOv3 ConvNeXt" if "convnext" in reid_variant.lower() else "DINOv3 ViT-B/16"
+    elif "vits14" in reid_variant.lower():
+        reid_label = "DINOv2 ViT-S/14"
+    else:
+        reid_label = "DINOv2 ViT-B/14"
+    face_label = "ArcFace buffalo_l" if biometric_mode else "Standard Re-ID"
+    if "da3" in depth_backend.lower():
+        depth_label = "Depth V3"
+    elif "yolo26" in depth_backend.lower():
+        depth_label = "YOLO26-Depth"
+    elif depth_backend == "midas_small":
+        depth_label = "MiDaS"
+    elif depth_backend == "y_prior":
+        depth_label = "Y-Prior"
+    else:
+        depth_label = "Depth V2"
+
     st.markdown(
         f"""
-        <div class="hero-banner">
-            <div class="hero-title">🎯 Long-Horizon Biometric Multi-Object Tracker</div>
-            <div class="hero-subtitle">
-                Clothes-invariant 2-Pass AI tracking with Pose Viewpoint Bucketing, ArcFace Facial Lock,
-                Depth Occlusion Protection, Single-Person Spotlight, and Zero-Overhead Baseline Benchmarking.
+        <div class="cmd-header">
+            <div class="cmd-top-row">
+                <div class="cmd-title">🎯 LONG-HORIZON BIOMETRIC MOT // COMMAND CENTER</div>
+                <div class="online-pill"><span class="online-dot"></span>{dev_str}</div>
             </div>
-            <div class="pill-row">
-                <span class="{dev_cls}">● {dev_label}</span>
-                <span class="status-pill">{det_label}</span>
-                <span class="status-pill">{reid_label}</span>
-                <span class="status-pill">{face_label}</span>
-                <span class="status-pill">Depth Anything V2</span>
+            <div class="cmd-subtitle">
+                Enterprise 2-Pass Clothes-Invariant Tracking · Persistent Biometric Vault ·
+                Spatial Zones & Heatmaps · Pose Anomaly Alerts · CLIP Search · Live CCTV & Forensics
+            </div>
+            <div class="badge-row">
+                <span class="model-badge">{_html.escape(det_label)}</span>
+                <span class="model-badge">{_html.escape(reid_label)}</span>
+                <span class="model-badge">{_html.escape(face_label)}</span>
+                <span class="model-badge">{_html.escape(depth_label)}</span>
+                <span class="model-badge">3-Tier Pass-2 Cascade</span>
             </div>
         </div>
         """,
@@ -3745,142 +4607,554 @@ def _render_hero_header(device: str, detector_weights: str, reid_variant: str, b
     )
 
 
+def _render_pipeline_stepper(active_stage: int) -> str:
+    """Return HTML for the 4-stage live execution stepper (1..4 active, 5=all done)."""
+    stages = [
+        ("[01]", "YOLO11-Pose Detection"),
+        ("[02]", "Multi-Angle Biometrics"),
+        ("[03]", "Pass-2 Consolidation"),
+        ("[04]", "H.264 Export"),
+    ]
+    blocks = []
+    for idx, (code, label) in enumerate(stages, start=1):
+        if active_stage > idx:
+            cls, icon = "step-box done", "✓"
+        elif active_stage == idx:
+            cls, icon = "step-box active", "◉"
+        else:
+            cls, icon = "step-box", "○"
+        blocks.append(f'<div class="{cls}"><span>{code} {label}</span><span>{icon}</span></div>')
+    return f'<div class="stepper-grid">{"".join(blocks)}</div>'
+
+
+def _render_cinema_bar(title: str, meta: str) -> None:
+    st.markdown(
+        f'<div class="cinema-bar"><span class="cinema-title">{_html.escape(title)}</span>'
+        f'<span class="cinema-meta">{_html.escape(meta)}</span></div>',
+        unsafe_allow_html=True,
+    )
+
+
+def _thumb_to_data_uri(jpg_bytes: Optional[bytes]) -> str:
+    if not jpg_bytes:
+        return ""
+    b64 = base64.b64encode(jpg_bytes).decode("ascii")
+    return f"data:image/jpeg;base64,{b64}"
+
+
+def _render_dossier_card_html(
+    pid: int,
+    pinfo: Dict[str, Any],
+    thumb_bytes: Optional[bytes],
+    vault_info: Optional[Dict[str, Any]] = None,
+    clip_score_pct: Optional[float] = None,
+    behavior_summary: Optional[Dict[str, Any]] = None,
+) -> str:
+    uri = _thumb_to_data_uri(thumb_bytes)
+    img_tag = f'<img src="{uri}" alt="Person #{pid}" />' if uri else '<span class="mono" style="color:#475569;">NO CROP</span>'
+    badges = []
+    if clip_score_pct is not None:
+        badges.append(f'<span class="mini-badge" style="background:rgba(16,185,129,0.22);color:#34D399;border:1px solid rgba(52,211,153,0.45);">CLIP {clip_score_pct:.0f}%</span>')
+    if vault_info and vault_info.get("is_watchlist"):
+        badges.append('<span class="mini-badge" style="background:rgba(244,63,94,0.22);color:#FB7185;border:1px solid rgba(251,113,133,0.45);">WATCHLIST</span>')
+    if pinfo.get("has_face_lock"):
+        badges.append('<span class="mini-badge mb-face">FACE</span>')
+    ang_code = pinfo.get("angle_code", "—")
+    if ang_code and ang_code != "—":
+        badges.append(f'<span class="mini-badge mb-angle">{_html.escape(ang_code)}</span>')
+    if int(pinfo.get("recovery_count", 0)) > 0:
+        badges.append(f'<span class="mini-badge mb-rec">RECOVERED ×{int(pinfo["recovery_count"])}</span>')
+    if behavior_summary and behavior_summary.get("anomalies"):
+        for an in behavior_summary["anomalies"][:2]:
+            badges.append(f'<span class="mini-badge" style="background:rgba(245,158,11,0.20);color:#FBBF24;border:1px solid rgba(251,191,36,0.40);">{_html.escape(an)}</span>')
+    if not badges:
+        badges.append('<span class="mini-badge mb-angle">TRACKED</span>')
+
+    vname = vault_info.get("display_name") if vault_info else None
+    id_heading = f"ID #{pid:02d} · {_html.escape(vname)}" if vname else f"ID #{pid:02d}"
+    hl_style = "border:1.5px solid #34D399;box-shadow:0 0 18px rgba(16,185,129,0.24);" if clip_score_pct is not None else ""
+
+    return (
+        f'<div class="dossier-card" style="{hl_style}">'
+        f'  <div class="reticle-wrap">'
+        f'    <span class="reticle-corner rc-tl"></span><span class="reticle-corner rc-tr"></span>'
+        f'    <span class="reticle-corner rc-bl"></span><span class="reticle-corner rc-br"></span>'
+        f'    {img_tag}'
+        f'  </div>'
+        f'  <div class="dossier-id">{id_heading}</div>'
+        f'  <div class="dossier-sub">{pinfo["duration_sec"]:.1f}s · {pinfo["frames_visible"]}f · {pinfo["recovery_count"]} rec</div>'
+        f'  <div>{"".join(badges)}</div>'
+        f'</div>'
+    )
+
+
+def build_cumulative_id_chart(
+    baseline_timeline: List[List[Tuple[int, np.ndarray, float]]],
+    consolidated_timeline: List[FrameSnapshot],
+    src_fps: float,
+) -> Optional[Any]:
+    """Interactive dark-theme Plotly chart: Cumulative Unique IDs Over Time (Baseline vs Long-Horizon)."""
+    if not PLOTLY_AVAILABLE or not consolidated_timeline:
+        return None
+    fps_safe = max(1.0, float(src_fps))
+    n = len(consolidated_timeline)
+    step = max(1, n // 300)
+
+    seen_base: Set[int] = set()
+    seen_ours: Set[int] = set()
+    ts_list: List[float] = []
+    base_curve: List[int] = []
+    ours_curve: List[int] = []
+
+    for idx, snap in enumerate(consolidated_timeline):
+        if idx < len(baseline_timeline):
+            for bid, _, _ in baseline_timeline[idx]:
+                seen_base.add(bid)
+        for tr in snap.active:
+            seen_ours.add(tr.track_id)
+        if idx % step == 0 or idx == n - 1:
+            ts_list.append(round(snap.frame_idx / fps_safe, 2))
+            base_curve.append(len(seen_base))
+            ours_curve.append(len(seen_ours))
+
+    fig = go.Figure()
+    fig.add_trace(
+        go.Scatter(
+            x=ts_list,
+            y=base_curve,
+            mode="lines",
+            name="Standard Baseline (Pure IoU)",
+            line=dict(color="#F43F5E", width=2.8),
+            fill="tozeroy",
+            fillcolor="rgba(244, 63, 94, 0.12)",
+            hovertemplate="Time: %{x:.1f}s<br>Standard IDs: <b>%{y}</b><extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=ts_list,
+            y=ours_curve,
+            mode="lines",
+            name="Long-Horizon Biometric AI",
+            line=dict(color="#06B6D4", width=3.0),
+            fill="tozeroy",
+            fillcolor="rgba(6, 182, 212, 0.14)",
+            hovertemplate="Time: %{x:.1f}s<br>Biometric AI IDs: <b>%{y}</b><extra></extra>",
+        )
+    )
+    fig.update_layout(
+        title=dict(text="Cumulative Unique IDs Over Time (Fragmentation Curve)", font=dict(family="Inter", size=14, color="#E2E8F0")),
+        height=310,
+        margin=dict(l=46, r=20, t=44, b=42),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="JetBrains Mono", color="#CBD5E1", size=11),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0, font=dict(family="Inter", size=12)),
+        xaxis=dict(title="Time (seconds)", gridcolor="rgba(148,163,184,0.12)", zeroline=False),
+        yaxis=dict(title="Cumulative Unique IDs", gridcolor="rgba(148,163,184,0.12)", zeroline=False),
+    )
+    return fig
+
+
+def build_fragmentation_gauge(frag_red_pct: float) -> Optional[Any]:
+    """Compact dark-theme Plotly gauge showing ID Fragmentation Reduction %."""
+    if not PLOTLY_AVAILABLE:
+        return None
+    val = float(np.clip(frag_red_pct, 0.0, 100.0))
+    fig = go.Figure(
+        go.Indicator(
+            mode="gauge+number",
+            value=val,
+            number=dict(suffix="%", font=dict(family="JetBrains Mono", size=34, color="#22D3EE")),
+            title=dict(text="ID Fragmentation Reduction", font=dict(family="Inter", size=13, color="#CBD5E1")),
+            gauge=dict(
+                axis=dict(range=[0, 100], tickfont=dict(family="JetBrains Mono", size=10, color="#94A3B8")),
+                bar=dict(color="#06B6D4"),
+                bgcolor="rgba(15, 23, 42, 0.85)",
+                borderwidth=1,
+                bordercolor="rgba(56, 189, 248, 0.25)",
+                steps=[
+                    dict(range=[0, 35], color="rgba(244, 63, 94, 0.16)"),
+                    dict(range=[35, 70], color="rgba(245, 158, 11, 0.16)"),
+                    dict(range=[70, 100], color="rgba(16, 185, 129, 0.20)"),
+                ],
+            ),
+        )
+    )
+    fig.update_layout(
+        height=310,
+        margin=dict(l=20, r=20, t=44, b=20),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+    )
+    return fig
+
+
+def build_gantt_presence_chart(
+    person_stats: Dict[int, Dict[str, Any]],
+    recoveries: List[Dict[str, Any]],
+    src_fps: float,
+) -> Optional[Any]:
+    """Interactive Plotly Gantt Identity Presence & Occlusion Recovery Timeline."""
+    if not PLOTLY_AVAILABLE or not person_stats:
+        return None
+    fps_safe = max(1.0, float(src_fps))
+    ids_sorted = sorted(person_stats.keys())
+
+    fig = go.Figure()
+    seg_x: List[Optional[float]] = []
+    seg_y: List[Optional[str]] = []
+    gap_x: List[Optional[float]] = []
+    gap_y: List[Optional[str]] = []
+
+    for pid in ids_sorted:
+        label = f"Person #{pid:02d}"
+        intervals = person_stats[pid].get("intervals", [])
+        for k, (sf, ef) in enumerate(intervals):
+            t0 = sf / fps_safe
+            t1 = max(t0 + 0.08, ef / fps_safe)
+            seg_x.extend([t0, t1, None])
+            seg_y.extend([label, label, None])
+            if k > 0:
+                prev_end = intervals[k - 1][1] / fps_safe
+                gap_x.extend([prev_end, t0, None])
+                gap_y.extend([label, label, None])
+
+    if seg_x:
+        fig.add_trace(
+            go.Scatter(
+                x=seg_x,
+                y=seg_y,
+                mode="lines",
+                name="Active Visibility",
+                line=dict(color="#06B6D4", width=9),
+                hovertemplate="%{y}<br>Visible @ %{x:.2f}s<extra></extra>",
+            )
+        )
+    if gap_x:
+        fig.add_trace(
+            go.Scatter(
+                x=gap_x,
+                y=gap_y,
+                mode="lines",
+                name="Bridged Occlusion Gap",
+                line=dict(color="#F59E0B", width=2.5, dash="dot"),
+                hovertemplate="%{y}<br>Occluded Gap @ %{x:.2f}s<extra></extra>",
+            )
+        )
+
+    # Recovery event emerald diamonds
+    rec_x: List[float] = []
+    rec_y: List[str] = []
+    rec_txt: List[str] = []
+    for rec in recoveries:
+        try:
+            rid = int(str(rec.get("Recovered ID", "#0")).lstrip("#"))
+        except ValueError:
+            continue
+        if rid not in person_stats:
+            continue
+        t_ev = float(rec.get("Frame", 0)) / fps_safe
+        rec_x.append(t_ev)
+        rec_y.append(f"Person #{rid:02d}")
+        rec_txt.append(
+            f"<b>{rec.get('Recovery Type', 'Recovery')}</b><br>"
+            f"Person #{rid:02d} @ {t_ev:.2f}s (F{rec.get('Frame', 0)})<br>"
+            f"Cue: {rec.get('Biometric Cue', 'N/A')}<br>"
+            f"Sim: {rec.get('Best Similarity', 0)} | Gap: {rec.get('Occlusion Frames', 0)}f"
+        )
+
+    if rec_x:
+        fig.add_trace(
+            go.Scatter(
+                x=rec_x,
+                y=rec_y,
+                mode="markers",
+                name="Biometric Recovery Event",
+                marker=dict(color="#10B981", size=12, symbol="diamond", line=dict(color="#ECFDF5", width=1.2)),
+                text=rec_txt,
+                hovertemplate="%{text}<extra></extra>",
+            )
+        )
+
+    chart_h = max(280, min(680, 95 + 38 * len(ids_sorted)))
+    fig.update_layout(
+        title=dict(text="Identity Presence, Occlusion Gaps & Biometric Recovery Events", font=dict(family="Inter", size=14, color="#E2E8F0")),
+        height=chart_h,
+        margin=dict(l=92, r=24, t=48, b=44),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="JetBrains Mono", color="#CBD5E1", size=11),
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1.0, font=dict(family="Inter", size=12)),
+        xaxis=dict(title="Timeline (seconds)", gridcolor="rgba(148,163,184,0.12)", zeroline=False),
+        yaxis=dict(
+            autorange="reversed",
+            gridcolor="rgba(148,163,184,0.10)",
+            categoryorder="array",
+            categoryarray=[f"Person #{pid:02d}" for pid in ids_sorted],
+        ),
+    )
+    return fig
+
+
 def main() -> None:
     _inject_custom_css()
     device_now = resolve_device("auto")
 
+    # -----------------------------------------------------------------------
+    # Sidebar Control Deck with Quick Presets & Organized Expanders
+    # -----------------------------------------------------------------------
     with st.sidebar:
-        st.header("Biometric 2-Pass Configuration")
+        st.markdown("### 🎛️ Command Control Deck")
 
-        biometric_mode = st.toggle(
-            "Clothes-Invariant Biometric Mode",
-            value=True,
-            help=(
-                "ON: 0% weight on clothing color. Uses ArcFace + Head/Hair above shoulders + "
-                "Grayscale Build + Skeletal Body Ratios + Lab (a*, b*) Skin Chroma.\n"
-                "OFF: Standard appearance + 2-zone clothing fusion."
-            ),
+        preset = st.radio(
+            "Operating Preset",
+            options=[
+                "Ultra Biometric (Best Accuracy)",
+                "Balanced (Recommended)",
+                "Fast Preview",
+            ],
+            index=1,
+            help="Automatically sets optimal detector, resolution, and stride defaults; override any knob below.",
         )
 
-        if biometric_mode:
-            detector_choice = st.selectbox(
-                "Pose & Person Detector (imgsz=960)",
-                options=[
-                    ("yolo11l-pose.pt — YOLO11-Large Pose (Default, 17 Keypoints)", "yolo11l-pose.pt"),
-                    ("yolo11x-pose.pt — YOLO11-XLarge Pose (Ultra-Accurate)", "yolo11x-pose.pt"),
-                ],
-                index=0,
-                format_func=lambda item: item[0],
+        preset_defaults = {
+            "Ultra Biometric (Best Accuracy)": {
+                "pose_idx": 3,   # yolo11l-pose.pt
+                "imgsz": 960,
+                "reid_idx": 0,   # dinov2_vitb14
+                "depth_stride": 1,
+                "face_stride": 1,
+                "biometric": True,
+                "turbo_gpu": True,
+            },
+            "Balanced (Recommended)": {
+                "pose_idx": 4,   # yolo11m-pose.pt
+                "imgsz": 768,
+                "reid_idx": 0,   # dinov2_vitb14
+                "depth_stride": 2,
+                "face_stride": 1,
+                "biometric": True,
+                "turbo_gpu": True,
+            },
+            "Fast Preview": {
+                "pose_idx": 6,   # yolo11n-pose.pt
+                "imgsz": 640,
+                "reid_idx": 1,   # dinov2_vits14
+                "depth_stride": 3,
+                "face_stride": 2,
+                "biometric": True,
+                "turbo_gpu": True,
+            },
+        }[preset]
+
+        with st.expander("🧠 AI Model Stack (2026 Ready)", expanded=True):
+            turbo_gpu = st.toggle(
+                "Turbo GPU Optimization (Batched FP16 + Smart Gating)",
+                value=preset_defaults["turbo_gpu"],
+                key=f"turbo_gpu_{preset}",
+                help=(
+                    "ON: FP16 Pose + FP16 single-batch DINO + Depth gating (overlap IoU>=0.15 or /4f) "
+                    "+ Pose-gated ArcFace (skip BACK, throttle >=4 samples) + Adaptive DINO stride."
+                ),
             )
-            detector_weights = detector_choice[1]
-            people_only = True
-        else:
-            detector_choice = st.selectbox(
-                "Detector Model (imgsz=960)",
-                options=[
-                    ("yolo11l.pt — YOLO11-Large (Default)", "yolo11l.pt"),
-                    ("yolo11x.pt — YOLO11-XLarge (Ultra-Accurate)", "yolo11x.pt"),
+            biometric_mode = st.toggle(
+                "Clothes-Invariant Biometric Mode",
+                value=preset_defaults["biometric"],
+                key=f"bio_mode_{preset}",
+                help="ON: 0% clothing weight (ArcFace + Head/Hair + Grayscale Build + Body Ratios + Lab Skin Chroma).",
+            )
+            if biometric_mode:
+                pose_options = [
+                    ("yolo26l-pose.pt — YOLO26-Large Pose (2026)", "yolo26l-pose.pt"),
+                    ("yolo26m-pose.pt — YOLO26-Medium Pose (2026)", "yolo26m-pose.pt"),
+                    ("yolo26n-pose.pt — YOLO26-Nano Pose (2026 Fast)", "yolo26n-pose.pt"),
+                    ("yolo11l-pose.pt — YOLO11-Large Pose (Ultra)", "yolo11l-pose.pt"),
+                    ("yolo11m-pose.pt — YOLO11-Medium Pose (Balanced)", "yolo11m-pose.pt"),
+                    ("yolo11x-pose.pt — YOLO11-XLarge Pose (Max)", "yolo11x-pose.pt"),
+                    ("yolo11n-pose.pt — YOLO11-Nano Pose (Fast)", "yolo11n-pose.pt"),
+                    ("rfdetr — RF-DETR Transformer (Optional)", "rfdetr"),
+                ]
+                detector_choice = st.selectbox(
+                    "Pose & Person Detector",
+                    options=pose_options,
+                    index=preset_defaults["pose_idx"],
+                    format_func=lambda item: item[0],
+                    key=f"pose_det_{preset}",
+                )
+                detector_weights = detector_choice[1]
+                people_only = True
+            else:
+                std_options = [
+                    ("yolo11m.pt — YOLO11-Medium (Balanced)", "yolo11m.pt"),
+                    ("yolo11l.pt — YOLO11-Large (Ultra)", "yolo11l.pt"),
+                    ("yolo11x.pt — YOLO11-XLarge (Max)", "yolo11x.pt"),
                     ("yolov8n.pt — YOLOv8-Nano (Fast)", "yolov8n.pt"),
+                    ("rfdetr — RF-DETR Transformer (Optional)", "rfdetr"),
+                ]
+                detector_choice = st.selectbox(
+                    "Object Detector",
+                    options=std_options,
+                    index=0,
+                    format_func=lambda item: item[0],
+                    key=f"std_det_{preset}",
+                )
+                detector_weights = detector_choice[1]
+                target_mode = st.radio(
+                    "Tracking Target",
+                    options=["People Only (Most Accurate)", "All Objects"],
+                    index=0,
+                )
+                people_only = target_mode == "People Only (Most Accurate)"
+
+            resolved_det_preview, trt_detected = _resolve_tensorrt_or_pt(detector_weights)
+            if trt_detected:
+                st.caption(f"⚡ TensorRT engine detected: `{Path(resolved_det_preview).name}` (auto-selected)")
+
+            imgsz_options = [640, 768, 960, 1024, 1280]
+            detector_imgsz = st.select_slider(
+                "Detector Resolution (imgsz)",
+                options=imgsz_options,
+                value=preset_defaults["imgsz"],
+                key=f"imgsz_{preset}",
+            )
+
+            reid_choice = st.selectbox(
+                "Re-ID Backbone (DINOv2 / DINOv3)",
+                options=REID_CATALOG,
+                index=preset_defaults["reid_idx"],
+                format_func=lambda item: item[0],
+                key=f"reid_{preset}",
+            )
+            reid_variant = reid_choice[1]
+
+            depth_choice = st.selectbox(
+                "Depth Occlusion Guard",
+                options=DEPTH_CATALOG,
+                index=0,
+                format_func=lambda item: item[0],
+            )
+            depth_backend = depth_choice[1]
+
+            if st.button(
+                "⚡ Export Current YOLO Model to TensorRT (.engine)",
+                disabled=(not detector_weights.lower().endswith(".pt")),
+                width="stretch",
+            ):
+                with st.spinner(f"Exporting `{detector_weights}` to FP16 TensorRT (imgsz={detector_imgsz})..."):
+                    trt_out = export_to_tensorrt(detector_weights, imgsz=detector_imgsz, half=True, device=0)
+                if trt_out.get("ok"):
+                    st.success(trt_out["message"])
+                else:
+                    st.warning(trt_out["message"])
+
+        with st.expander("🛡️ Vault, Mask-Clean, Behavior & Privacy", expanded=True):
+            mask_clean_biometrics = st.toggle(
+                "Mask-Clean Biometrics (YOLO-Seg Background Strip)",
+                value=False,
+                help="Runs YOLO-Seg on keyframes to replace background pixels with ImageNet mean gray before DINO/skin extraction.",
+            )
+            match_vault = st.toggle(
+                "Match Against Persistent Biometric Vault",
+                value=True,
+                help="Matches confirmed people against SQLite cross-video memory & watchlist (`data/biometric_vault.db`).",
+            )
+            enable_pose_behavior = st.toggle(
+                "Pose Behavior & Fall Detection",
+                value=True,
+                help="Zero-cost 17-keypoint classifier: FALL_ALERT, RUNNING, HANDS_RAISED, SITTING, STANDING.",
+            )
+            privacy_mode = st.selectbox(
+                "Privacy Blur Mode",
+                options=["Off", "Blur Non-Targets in Spotlight", "Anonymize All Faces"],
+                index=0,
+                help="Selectively anonymizes non-target faces in Solo Spotlight or all faces across Full Scene renders.",
+            )
+            privacy_style = st.radio(
+                "Privacy Blur Style",
+                options=["Gaussian Blur", "Pixelate"],
+                index=0,
+                horizontal=True,
+            )
+
+        with st.expander("🧬 Biometric & Re-ID Engine", expanded=False):
+            ghost_preset = st.selectbox(
+                "Ghost Particle Memory",
+                options=[
+                    ("60s / 1800 frames (Default)", 1800),
+                    ("40s / 1200 frames", 1200),
+                    ("30s / 900 frames", 900),
+                    ("90s / 2700 frames", 2700),
                 ],
                 index=0,
                 format_func=lambda item: item[0],
             )
-            detector_weights = detector_choice[1]
-            target_mode = st.radio(
-                "Tracking Target",
-                options=["People Only (Most Accurate)", "All Objects"],
-                index=0,
-            )
-            people_only = target_mode == "People Only (Most Accurate)"
+            max_ghost_age = ghost_preset[1]
 
-        reid_choice = st.selectbox(
-            "Head / Shape DINOv2 Backbone",
-            options=[
-                ("dinov2_vitb14 — DINOv2 ViT-B/14 (Default, Max Accuracy)", "dinov2_vitb14"),
-                ("dinov2_vits14 — DINOv2 ViT-S/14 (Faster Fallback)", "dinov2_vits14"),
-            ],
-            index=0,
-            format_func=lambda item: item[0],
-        )
-        reid_variant = reid_choice[1]
-
-        depth_backend = st.selectbox(
-            "Depth Occlusion Model",
-            options=["depth_anything", "midas_small", "y_prior"],
-            index=0,
-            help="depth_anything loads depth-anything/Depth-Anything-V2-Small-hf.",
-        )
-
-        ghost_preset = st.selectbox(
-            "Ghost Memory Duration",
-            options=[
-                ("60s / 1800 frames (Default)", 1800),
-                ("40s / 1200 frames", 1200),
-                ("30s / 900 frames", 900),
-                ("90s / 2700 frames", 2700),
-            ],
-            index=0,
-            format_func=lambda item: item[0],
-        )
-        max_ghost_age = ghost_preset[1]
-
-        show_skeleton = st.toggle(
-            "Draw 17-keypoint skeleton overlay",
-            value=False,
-            help="Draws COCO 17-keypoint skeletal joints and limbs color-coded by persistent #ID.",
-        )
-
-        show_verifying = st.toggle(
-            "Show unconfirmed verifying boxes & <6f blips",
-            value=False,
-            help="Off by default so only stable sequential IDs (#1, #2, #3...) with >=6 frames appear.",
-        )
-
-        with st.expander("Advanced Speed / Detection", expanded=False):
-            depth_stride = st.slider("Depth Model Stride (frames)", min_value=1, max_value=4, value=2)
-            face_stride = st.slider(
-                "ArcFace Extraction Stride (frames)",
-                min_value=1,
-                max_value=4,
-                value=1,
-                help="1 = check visible head crops every frame for maximum face capture.",
-            )
             conf_thresh = st.slider(
-                "Detection Confidence Threshold",
+                "Detection Confidence",
                 min_value=0.20,
                 max_value=0.70,
                 value=0.35,
                 step=0.05,
             )
+            depth_stride = st.slider(
+                "Depth Stride (frames)",
+                min_value=1,
+                max_value=4,
+                value=preset_defaults["depth_stride"],
+                key=f"dstride_{preset}",
+            )
+            face_stride = st.slider(
+                "ArcFace Stride (frames)",
+                min_value=1,
+                max_value=4,
+                value=preset_defaults["face_stride"],
+                key=f"fstride_{preset}",
+            )
+
+        with st.expander("🎥 HUD & Visual Overlays", expanded=False):
+            show_skeleton = st.toggle(
+                "Draw 17-keypoint skeleton overlay",
+                value=False,
+                help="Renders COCO 17-keypoint limbs and joints color-coded by persistent #ID.",
+            )
+            show_verifying = st.toggle(
+                "Show unconfirmed verifying boxes & <6f blips",
+                value=False,
+                help="Off by default so only stable sequential IDs (#1, #2, #3...) appear.",
+            )
 
         st.divider()
         st.caption(
-            "**Locked AGENTS.md & 3-Tier Cascade**\n"
-            "- Pass-1 Clean-View Gate & Depth Lock (`IoU >= 0.25`)\n"
-            "- Pass-1 Probation & Margin (`>= 15f`, `sim >= 0.72`, `margin >= 0.08`)\n"
-            "- Pass-2 Tier 0: `HANDOFF_OVERLAP_BRIDGE` + `ROTATION_SPATIAL_BRIDGE`\n"
-            "- Pass-2 Tier 1: `BIOMETRIC_FACE_LOCK` (ArcFace `>= 0.40`, 0% clothing)\n"
-            "- Pass-2 Tier 2: Angle-aware `BIOMETRIC_HEAD_BODY_SKIN` (`>= 0.66`, 0% clothing)"
+            "**AGENTS.md Core Invariants**\n"
+            "- Clean-View Gate & Depth Lock (`IoU >= 0.25`)\n"
+            "- Pass-1 Probation (`>= 15f`, `sim >= 0.72`, `margin >= 0.08`)\n"
+            "- Pass-2 Tier 0: Overlap Handoff & Turn Bridge\n"
+            "- Pass-2 Tier 1: ArcFace Lock (`>= 0.40`, 0% clothing)\n"
+            "- Pass-2 Tier 2: Angle-Aware Biometrics (`>= 0.66`)"
         )
 
-    _render_hero_header(device_now, detector_weights, reid_variant, biometric_mode)
+    _render_command_header(device_now, detector_weights, reid_variant, biometric_mode, detector_imgsz, depth_backend)
 
     # -----------------------------------------------------------------------
-    # Video Upload & Trigger Bar
+    # Video Upload Dropzone & Execution Trigger
     # -----------------------------------------------------------------------
-    up_col, btn_col = st.columns([3, 1], vertical_alignment="bottom")
+    up_col, cam_col, btn_col = st.columns([2.6, 1.0, 1.0], vertical_alignment="bottom")
     with up_col:
         uploaded_file = st.file_uploader(
-            "Upload video (.mp4, .mov, .avi, .mkv)",
+            "Drop surveillance or multi-person video (.mp4, .mov, .avi, .mkv)",
             type=["mp4", "mov", "avi", "mkv"],
             accept_multiple_files=False,
         )
-    with btn_col:
-        run_label = (
-            "🚀 Run Biometric Tracking"
-            if biometric_mode
-            else "🚀 Run Standard Tracking"
+    with cam_col:
+        camera_label_input = st.text_input(
+            "Camera / Location Label",
+            value="Camera 1",
+            help="Stored in Biometric Vault sightings for cross-camera audit trails.",
         )
+    with btn_col:
+        run_label = "🚀 Launch Biometric Pipeline" if biometric_mode else "🚀 Launch Standard Pipeline"
         run_clicked = st.button(
             run_label,
             type="primary",
@@ -3890,7 +5164,7 @@ def main() -> None:
 
     if uploaded_file is not None:
         up_mb = len(uploaded_file.getvalue()) / (1024 * 1024)
-        st.caption(f"Ready: `{uploaded_file.name}` ({up_mb:.2f} MB)")
+        st.caption(f"Staged input: `{uploaded_file.name}` · `{up_mb:.2f} MB` · Preset: `{preset}` · Camera: `{camera_label_input}`")
 
     if run_clicked and uploaded_file is not None:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -3902,6 +5176,8 @@ def main() -> None:
         saved_events = UPLOADS_DIR / f"{stem}_{ts}_events_biometric.jsonl"
         saved_input.write_bytes(uploaded_file.getvalue())
 
+        stepper_placeholder = st.empty()
+        stepper_placeholder.markdown(_render_pipeline_stepper(1), unsafe_allow_html=True)
         progress_bar = st.progress(0.0)
         status_placeholder = st.empty()
         status_placeholder.markdown(f"Saved upload to `{saved_input.relative_to(ROOT)}`. Preparing cached AI models...")
@@ -3924,155 +5200,298 @@ def main() -> None:
                 conf_thresh=conf_thresh,
                 progress_bar=progress_bar,
                 status_placeholder=status_placeholder,
+                detector_imgsz=detector_imgsz,
+                stepper_placeholder=stepper_placeholder,
+                turbo_gpu=turbo_gpu,
+                mask_clean_biometrics=mask_clean_biometrics,
+                match_vault=match_vault,
+                enable_pose_behavior=enable_pose_behavior,
+                privacy_mode=privacy_mode,
+                privacy_style=privacy_style,
+                camera_label=camera_label_input or "Camera 1",
             )
             st.session_state["last_upload_run_v6"] = job_result
+            st.session_state.pop("clip_search_results_v6", None)
+            st.session_state.pop("last_zone_result_v6", None)
+            st.session_state.pop("last_heatmap_result_v6", None)
             status_placeholder.success(
-                f"Tracking complete! Processed **{job_result['frames_processed']}** frames in "
+                f"Pipeline complete! Processed **{job_result['frames_processed']}** frames in "
                 f"**{job_result['elapsed_sec']}s** (Pass-1: **{job_result['pass1_fps']:.1f} FPS**, "
                 f"End-to-End: **{job_result['avg_fps']:.1f} FPS**) — "
                 f"**{job_result['confirmed_unique_ids']}** Confirmed People vs "
                 f"**{job_result['baseline_unique_ids']}** Standard Baseline IDs."
             )
+            for note in job_result.get("model_notes", []):
+                if "fell back" in note.lower() or "unavailable" in note.lower():
+                    st.info(f"Model Fallback Note: {note}")
         except Exception as exc:
             status_placeholder.error(f"Biometric 2-Pass Tracking failed: {exc}")
             raise
 
     # -----------------------------------------------------------------------
-    # 4-Tab Professional Workspace (persisted in session_state — zero Pass-1 reruns!)
+    # 6-Tab Enterprise Command Workspace (Vault & Live CCTV always available!)
     # -----------------------------------------------------------------------
     res: Optional[Dict[str, Any]] = st.session_state.get("last_upload_run_v6")
-    if res is None:
-        st.info(
-            "Upload a `.mp4`, `.mov`, `.avi`, or `.mkv` video above and click **Run Biometric Tracking** to unlock "
-            "Full Scene Tracking, Single-Person Spotlight Focus, Standard vs. Long-Horizon Comparison, and the Biometric Recovery Log."
-        )
-        return
+    vault = get_biometric_vault()
 
-    counters = res.get("counters", {})
-    person_stats: Dict[int, Dict[str, Any]] = res.get("person_stats", {})
-    person_thumbs: Dict[int, bytes] = res.get("person_thumbnails", {})
-    consolidated_timeline: List[FrameSnapshot] = res.get("consolidated_timeline", [])
-    baseline_timeline: List[List[Tuple[int, np.ndarray, float]]] = res.get("baseline_timeline", [])
-    recoveries: List[Dict[str, Any]] = res.get("recoveries", [])
-    source_video_path = Path(res.get("source_video_path", res.get("input_path", "")))
-    src_fps = float(res.get("src_fps", 30.0))
-
-    confirmed_ids_count = int(res.get("confirmed_unique_ids", len(person_stats)))
-    baseline_ids_count = int(res.get("baseline_unique_ids", confirmed_ids_count))
-    pass1_stitches = int(res.get("pass1_stitches", counters.get("stitches", 0)))
-    pass2_turns = int(res.get("pass2_turn_bridges", 0))
-    pass2_face = int(res.get("pass2_face_locks", 0))
-    pass2_bio = int(res.get("pass2_bio_merges", 0))
-    total_recoveries = int(res.get("total_recoveries", pass1_stitches + pass2_turns + pass2_face + pass2_bio))
-    max_occ_frames = int(res.get("max_occ_frames", 0))
-    max_occ_sec = float(res.get("max_occ_sec", 0.0))
-    pass1_fps = float(res.get("pass1_fps", res.get("avg_fps", 0.0)))
-    avg_fps = float(res.get("avg_fps", 0.0))
-
-    tab1, tab2, tab3, tab4 = st.tabs(
+    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs(
         [
-            "🎬 Full Scene Tracking",
-            "🔍 Single-Person Focus (Select by ID)",
-            "⚖️ Standard vs. Long-Horizon Comparison",
-            "🧬 Biometric Recovery Log & Timeline",
+            "🎬 Full Scene & AI Search",
+            "🔍 Single-Person Focus & Privacy",
+            "⚖️ Standard vs. Long-Horizon",
+            "🗺️ Zones, Heatmap & Behavior",
+            "🔐 Biometric Vault & Watchlist",
+            "📡 Live CCTV & Forensic Export",
         ]
     )
 
+    if res is not None:
+        counters = res.get("counters", {})
+        person_stats: Dict[int, Dict[str, Any]] = res.get("person_stats", {})
+        person_thumbs: Dict[int, bytes] = res.get("person_thumbnails", {})
+        consolidated_timeline: List[FrameSnapshot] = res.get("consolidated_timeline", [])
+        baseline_timeline: List[List[Tuple[int, np.ndarray, float]]] = res.get("baseline_timeline", [])
+        recoveries: List[Dict[str, Any]] = res.get("recoveries", [])
+        seq_profiles: Dict[int, TrackBiometricProfile] = res.get("seq_profiles", {})
+        vault_matches: Dict[int, Dict[str, Any]] = res.get("vault_matches", {})
+        pose_result: Optional[Dict[str, Any]] = res.get("pose_result")
+        pose_summaries: Dict[int, Dict[str, Any]] = (pose_result or {}).get("track_summaries", {})
+        source_video_path = Path(res.get("source_video_path", res.get("input_path", "")))
+        src_fps = float(res.get("src_fps", 30.0))
+        total_video_frames = max(1, int(res.get("frames_processed", len(consolidated_timeline) or 1)))
+        confirmed_ids_count = int(res.get("confirmed_unique_ids", len(person_stats)))
+        baseline_ids_count = int(res.get("baseline_unique_ids", confirmed_ids_count))
+        pass1_stitches = int(res.get("pass1_stitches", counters.get("stitches", 0)))
+        pass2_turns = int(res.get("pass2_turn_bridges", 0))
+        pass2_face = int(res.get("pass2_face_locks", 0))
+        pass2_bio = int(res.get("pass2_bio_merges", 0))
+        total_recoveries = int(res.get("total_recoveries", pass1_stitches + pass2_turns + pass2_face + pass2_bio))
+        max_occ_frames = int(res.get("max_occ_frames", 0))
+        max_occ_sec = float(res.get("max_occ_sec", 0.0))
+        pass1_fps = float(res.get("pass1_fps", res.get("avg_fps", 0.0)))
+        avg_fps = float(res.get("avg_fps", 0.0))
+    else:
+        counters = {}
+        person_stats = {}
+        person_thumbs = {}
+        consolidated_timeline = []
+        baseline_timeline = []
+        recoveries = []
+        seq_profiles = {}
+        vault_matches = {}
+        pose_result = None
+        pose_summaries = {}
+        source_video_path = Path("")
+        src_fps = 30.0
+        total_video_frames = 1
+        confirmed_ids_count = 0
+        baseline_ids_count = 0
+        pass1_stitches = 0
+        pass2_turns = 0
+        pass2_face = 0
+        pass2_bio = 0
+        total_recoveries = 0
+        max_occ_frames = 0
+        max_occ_sec = 0.0
+        pass1_fps = 0.0
+        avg_fps = 0.0
+
     # =======================================================================
-    # TAB 1 — Full Scene Tracking
+    # TAB 1 — Full Scene Tracking, Natural-Language CLIP Search & Dossier Roster
     # =======================================================================
     with tab1:
-        k1, k2, k3, k4 = st.columns(4)
-        k1.metric(
-            "Confirmed People" if res.get("people_only", True) else "Confirmed Objects",
-            confirmed_ids_count,
-            delta=f"Sequential #1..#{confirmed_ids_count}" if confirmed_ids_count > 0 else "None",
-            delta_color="off",
-        )
-        k2.metric(
-            "Total Biometric Recoveries",
-            total_recoveries,
-            delta=f"Handoff/Turn: {pass2_turns} | Face: {pass2_face} | Bio: {pass2_bio} | P1: {pass1_stitches}",
-            delta_color="off",
-        )
-        k3.metric(
-            "Max Occlusion Survived",
-            f"{max_occ_frames}f" if max_occ_frames > 0 else "0f",
-            delta=f"{max_occ_sec:.2f}s | {res.get('backfilled_frame_boxes', 0)}f back-filled",
-            delta_color="off",
-        )
-        k4.metric(
-            "Processing FPS",
-            f"{pass1_fps:.1f} / {avg_fps:.1f}",
-            delta=f"Pass-1 / Overall ({res.get('frames_processed', 0)}f @ {res.get('resolution', 'N/A')})",
-            delta_color="off",
-        )
-
-        out_path = Path(res["output_path"])
-        if out_path.exists():
-            video_bytes = out_path.read_bytes()
-            size_mb = len(video_bytes) / (1024 * 1024)
-            hdr_l, hdr_r = st.columns([3, 1], vertical_alignment="center")
-            hdr_l.subheader("Full-Scene Consolidated Output (H.264 / `yuv420p`)")
-            hdr_r.download_button(
-                label=f"⬇️ Download Full Tracked MP4 ({size_mb:.1f} MB)",
-                data=video_bytes,
-                file_name=out_path.name,
-                mime="video/mp4",
-                width="stretch",
+        if res is None:
+            st.info(
+                "Upload a video above and click **Launch Biometric Pipeline** to view Full Scene Tracking, "
+                "Natural-Language CLIP Target Search, and the Biometric Dossier Roster. "
+                "(You can already enroll Watchlist photos in **Tab 5** or open Live CCTV in **Tab 6**!)"
             )
-            st.caption(
-                f"Stack: `{res.get('detector_weights', 'yolo11l-pose.pt')}@{res.get('imgsz', 960)}` · "
-                f"`{res.get('reid_backend', 'dinov2_vitb14')}` · `{res.get('face_backend', 'ArcFace')}` · "
-                f"`{res.get('depth_backend', 'depth_anything')}` ({str(res.get('device', 'cpu')).upper()}) · "
-                f"Faces Captured: `{res.get('faces_extracted_total', 0)}` · Depth Locks: `{counters.get('depth_occlusions', 0)}`"
+        else:
+            k1, k2, k3, k4 = st.columns(4)
+            k1.metric(
+                "Confirmed People" if res.get("people_only", True) else "Confirmed Objects",
+                confirmed_ids_count,
+                delta=f"Sequential #01..#{confirmed_ids_count:02d}" if confirmed_ids_count > 0 else "None",
+                delta_color="off",
             )
-            st.video(video_bytes, format="video/mp4")
-        else:
-            st.warning(f"Tracked output video not found at `{out_path}`.")
+            k2.metric(
+                "Total Biometric Recoveries",
+                total_recoveries,
+                delta=f"T0:{pass2_turns} · Face:{pass2_face} · Bio:{pass2_bio} · P1:{pass1_stitches}",
+                delta_color="off",
+            )
+            k3.metric(
+                "Max Occlusion Survived",
+                f"{max_occ_frames}f" if max_occ_frames > 0 else "0f",
+                delta=f"{max_occ_sec:.2f}s · {res.get('backfilled_frame_boxes', 0)}f back-filled",
+                delta_color="off",
+            )
+            k4.metric(
+                "Processing FPS",
+                f"{pass1_fps:.1f} / {avg_fps:.1f}",
+                delta=f"Pass-1 / Total ({total_video_frames}f @ {res.get('resolution', 'N/A')})",
+                delta_color="off",
+            )
 
-        st.subheader("Detected People Roster")
-        if person_stats:
-            ids_sorted = sorted(person_stats.keys())
-            cols_per_row = min(6, max(1, len(ids_sorted)))
-            for row_start in range(0, len(ids_sorted), cols_per_row):
-                row_ids = ids_sorted[row_start : row_start + cols_per_row]
-                row_cols = st.columns(cols_per_row)
-                for col_obj, pid in zip(row_cols, row_ids):
-                    pinfo = person_stats[pid]
-                    with col_obj:
-                        if pid in person_thumbs:
-                            st.image(person_thumbs[pid], width="stretch")
-                        face_badge = "🟢 Face Locked" if pinfo["has_face_lock"] else "🔵 Head+Body"
-                        rec_txt = f" · {pinfo['recovery_count']} rec" if pinfo["recovery_count"] > 0 else ""
-                        st.markdown(
-                            f"**Person #{pid}**  \n"
-                            f"`{pinfo['duration_sec']:.1f}s` ({pinfo['frames_visible']}f)  \n"
-                            f"{face_badge}{rec_txt}"
-                        )
-        else:
-            st.info("No confirmed people were detected in this clip.")
+            out_path = Path(res["output_path"])
+            if out_path.exists():
+                video_bytes = out_path.read_bytes()
+                size_mb = len(video_bytes) / (1024 * 1024)
+                hdr_l, hdr_r = st.columns([3.2, 1.0], vertical_alignment="bottom")
+                with hdr_l:
+                    _render_cinema_bar(
+                        "PRIMARY FEED // PASS-2 BIOMETRIC CONSOLIDATED OUTPUT",
+                        f"{res.get('resolution', 'N/A')} · {src_fps:.1f} FPS · H.264 YUV420P · {size_mb:.1f} MB",
+                    )
+                with hdr_r:
+                    st.download_button(
+                        label=f"⬇️ Download Full MP4 ({size_mb:.1f} MB)",
+                        data=video_bytes,
+                        file_name=out_path.name,
+                        mime="video/mp4",
+                        width="stretch",
+                    )
+                st.video(video_bytes, format="video/mp4")
+            else:
+                st.warning(f"Tracked output video not found at `{out_path}`.")
+
+            # --- Natural-Language CLIP Target Search Bar ---
+            st.markdown("#### 🔎 Natural-Language CLIP Target Search")
+            sq_col, sb_col, sc_col = st.columns([3.2, 0.9, 0.7], vertical_alignment="bottom")
+            with sq_col:
+                clip_query = st.text_input(
+                    "Search people by description...",
+                    placeholder="e.g. 'person wearing glasses near the counter', 'man carrying a backpack', 'red shirt'",
+                    key="clip_nl_query_input",
+                )
+            with sb_col:
+                clip_search_clicked = st.button(
+                    "🔍 Search IDs",
+                    type="primary",
+                    disabled=(not clip_query.strip() or not person_stats),
+                    width="stretch",
+                )
+            with sc_col:
+                if st.button("Clear", width="stretch", key="clip_clear_btn"):
+                    st.session_state.pop("clip_search_results_v6", None)
+
+            if clip_search_clicked and clip_query.strip():
+                with st.spinner("Loading FP16 CLIP ViT-B/32 & ranking confirmed people..."):
+                    searcher = load_clip_searcher(device=device_now)
+                    if not searcher.available:
+                        st.warning(searcher.status_note)
+                    else:
+                        if res.get("clip_indexed_video") != str(source_video_path):
+                            n_idx = searcher.index_from_timeline(source_video_path, consolidated_timeline, top_k=3)
+                            res["clip_indexed_video"] = str(source_video_path)
+                            res["clip_indexed_count"] = n_idx
+                        ranked = searcher.search(clip_query.strip(), top_k=max(4, len(person_stats)))
+                        st.session_state["clip_search_results_v6"] = {
+                            "query": clip_query.strip(),
+                            "ranked": ranked,
+                        }
+
+            clip_scores_map: Dict[int, float] = {}
+            clip_state = st.session_state.get("clip_search_results_v6")
+            if clip_state and clip_state.get("ranked"):
+                ranked_items = clip_state["ranked"]
+                st.success(f"CLIP Search for **\"{clip_state['query']}\"** — Top matches highlighted below:")
+                top_cols = st.columns(min(4, len(ranked_items)))
+                for col_i, (rtid, rpct, rcrop) in zip(top_cols, ranked_items[:4]):
+                    clip_scores_map[int(rtid)] = float(rpct)
+                    with col_i:
+                        st.image(rcrop, caption=f"Person #{rtid:02d} · {rpct:.1f}% match", width="stretch")
+
+            # --- Biometric Dossier Roster + Inline Name / Save to Vault ---
+            st.markdown("#### 🗂️ Biometric Dossier Roster")
+            if person_stats:
+                if clip_scores_map:
+                    ids_sorted = sorted(
+                        person_stats.keys(),
+                        key=lambda pid: (-clip_scores_map.get(pid, -1.0), pid),
+                    )
+                else:
+                    ids_sorted = sorted(person_stats.keys())
+
+                for row_start in range(0, len(ids_sorted), 4):
+                    row_ids = ids_sorted[row_start : row_start + 4]
+                    row_cols = st.columns(4)
+                    for col_obj, pid in zip(row_cols, row_ids):
+                        with col_obj:
+                            v_inf = vault_matches.get(pid)
+                            st.markdown(
+                                _render_dossier_card_html(
+                                    pid,
+                                    person_stats[pid],
+                                    person_thumbs.get(pid),
+                                    vault_info=v_inf,
+                                    clip_score_pct=clip_scores_map.get(pid),
+                                    behavior_summary=pose_summaries.get(pid),
+                                ),
+                                unsafe_allow_html=True,
+                            )
+                            with st.expander(f"🏷️ Name / Save #{pid:02d} to Vault", expanded=False):
+                                cur_vname = (v_inf or {}).get("display_name") or ""
+                                cur_wl = bool((v_inf or {}).get("is_watchlist", False))
+                                new_lbl = st.text_input(
+                                    "Person Name",
+                                    value=cur_vname,
+                                    placeholder="e.g. Cashier - Arjun",
+                                    key=f"inline_vname_{pid}",
+                                )
+                                new_wl = st.checkbox("Watchlist Alert", value=cur_wl, key=f"inline_vwl_{pid}")
+                                if st.button("💾 Save to Vault", key=f"inline_vsave_{pid}", width="stretch"):
+                                    ps = person_stats[pid]
+                                    f_sec = round(max(0, int(ps.get("first_frame", 1)) - 1) / max(1.0, src_fps), 2)
+                                    l_sec = round(max(0, int(ps.get("last_frame", 1)) - 1) / max(1.0, src_fps), 2)
+                                    existing_vid = v_inf["vault_id"] if v_inf else None
+                                    saved_vid = vault.upsert_track_identity(
+                                        track_biometrics=seq_profiles.get(pid),
+                                        vault_id=existing_vid,
+                                        display_name=new_lbl.strip() or None,
+                                        is_watchlist=new_wl,
+                                        video_name=source_video_path.name if source_video_path.name else "video.mp4",
+                                        camera_label=camera_label_input or "Camera 1",
+                                        first_sec=f_sec,
+                                        last_sec=l_sec,
+                                        thumbnail_jpeg=person_thumbs.get(pid),
+                                    )
+                                    vault.rename_identity(saved_vid, new_lbl.strip() or None, is_watchlist=new_wl)
+                                    vault_matches[pid] = {
+                                        "vault_id": saved_vid,
+                                        "display_name": new_lbl.strip() or None,
+                                        "is_watchlist": new_wl,
+                                        "confidence": 1.0,
+                                        "cue": "USER_LABELED",
+                                    }
+                                    res["vault_matches"] = vault_matches
+                                    st.success(f"Saved #{pid:02d} -> `{new_lbl.strip() or f'Vault #{saved_vid}'}`")
+                                    st.rerun()
+            else:
+                st.info("No confirmed people were detected in this clip.")
 
     # =======================================================================
-    # TAB 2 — Single-Person Focus (Select by ID)
+    # TAB 2 — Single-Person Focus & Privacy Mode
     # =======================================================================
     with tab2:
-        if not person_stats:
-            st.info("No confirmed identities available to isolate.")
+        if res is None or not person_stats:
+            st.info("Run the pipeline on a video first to isolate a single person and render Privacy Spotlight exports.")
         else:
             ids_sorted = sorted(person_stats.keys())
 
             def _fmt_person(pid: int) -> str:
                 ps = person_stats[pid]
-                fb = "Face Locked" if ps["has_face_lock"] else "Head+Body+Skin"
+                v_inf = vault_matches.get(pid) or {}
+                v_name = f" ({v_inf['display_name']})" if v_inf.get("display_name") else ""
+                fb = "Face Locked" if ps["has_face_lock"] else f"Angles {ps.get('angle_code', '—')}"
                 rc = ps["recovery_count"]
                 rlabel = f"{rc} Recovery" if rc == 1 else f"{rc} Recoveries"
-                return f"Person #{pid} — Seen {ps['duration_sec']:.1f}s | {fb} | {rlabel}"
+                return f"Person #{pid:02d}{v_name} — Seen {ps['duration_sec']:.1f}s | {fb} | {rlabel}"
 
-            sel_col, prev_col = st.columns([3, 1], vertical_alignment="top")
-            with sel_col:
+            ctrl_col, dos_col = st.columns([1.55, 1.45], vertical_alignment="top")
+            with ctrl_col:
                 selected_pid = st.selectbox(
-                    "Select Target Person by Persistent ID",
+                    "Select Target Identity",
                     options=ids_sorted,
                     index=0,
                     format_func=_fmt_person,
@@ -4089,24 +5508,72 @@ def main() -> None:
                     key="solo_spotlight_mode",
                 )
                 opt_c1, opt_c2, opt_c3 = st.columns(3)
-                draw_trail_opt = opt_c1.toggle("Draw Movement Trajectory Trail", value=True, key="solo_trail")
-                show_occ_hud_opt = opt_c2.toggle(
-                    'Show "TARGET OCCLUDED / RE-ACQUIRING" HUD',
-                    value=True,
-                    key="solo_occ_hud",
+                draw_trail_opt = opt_c1.toggle("Motion Trail", value=True, key="solo_trail")
+                show_occ_hud_opt = opt_c2.toggle("Occluded HUD", value=True, key="solo_occ_hud")
+                solo_skel_opt = opt_c3.toggle("17-Kpt Skeleton", value=show_skeleton, key="solo_skel")
+
+                priv_c1, priv_c2 = st.columns([1.4, 1.0])
+                solo_blur_others = priv_c1.toggle(
+                    "Privacy Blur (Blur everyone else's faces)",
+                    value=(privacy_mode != "Off"),
+                    key="solo_privacy_blur",
                 )
-                solo_skel_opt = opt_c3.toggle("Draw 17-Keypoint Skeleton", value=show_skeleton, key="solo_skel")
+                solo_blur_style = priv_c2.selectbox(
+                    "Blur Style",
+                    options=["Gaussian Blur", "Pixelate"],
+                    index=0 if privacy_style == "Gaussian Blur" else 1,
+                    key="solo_privacy_style",
+                )
 
                 render_solo_clicked = st.button(
-                    f"🎯 Render Selected Person Video (Person #{selected_pid})",
+                    f"🎯 Render Selected Person Video (ID #{selected_pid:02d})",
                     type="primary",
                     width="stretch",
                 )
-            with prev_col:
-                if selected_pid in person_thumbs:
-                    st.image(person_thumbs[selected_pid], caption=f"Person #{selected_pid} Portrait", width="stretch")
 
-            solo_cache_key = f"p{selected_pid}_{spotlight_mode[:3]}_{int(draw_trail_opt)}_{int(show_occ_hud_opt)}_{int(solo_skel_opt)}"
+            pinfo = person_stats[selected_pid]
+            v_sel = vault_matches.get(selected_pid) or {}
+            sel_name = v_sel.get("display_name")
+            cov_pct = min(100.0, 100.0 * float(pinfo["frames_visible"]) / float(total_video_frames))
+            bfrags = pinfo["baseline_fragment_ids"]
+            with dos_col:
+                uri = _thumb_to_data_uri(person_thumbs.get(selected_pid))
+                img_html = (
+                    f'<img class="solo-dossier-img" src="{uri}" alt="Person #{selected_pid}" />'
+                    if uri
+                    else '<div class="solo-dossier-img" style="display:flex;align-items:center;justify-content:center;color:#475569;font-family:JetBrains Mono;font-size:0.75rem;">NO CROP</div>'
+                )
+                face_b = '<span class="mini-badge mb-face">ARCFACE LOCKED</span>' if pinfo["has_face_lock"] else '<span class="mini-badge mb-angle">HEAD/BODY/SKIN</span>'
+                ang_b = f'<span class="mini-badge mb-angle">ANGLES: {_html.escape(pinfo.get("angle_code", "—"))}</span>'
+                name_hdr = f" · {_html.escape(sel_name)}" if sel_name else ""
+                st.markdown(
+                    f"""
+                    <div class="solo-dossier">
+                        {img_html}
+                        <div>
+                            <div class="dossier-id">TARGET DOSSIER // PERSON #{selected_pid:02d}{name_hdr}</div>
+                            <div style="margin:0.25rem 0 0.45rem 0;">{face_b}{ang_b}</div>
+                            <div class="dossier-sub">
+                                Coverage: <b>{cov_pct:.1f}%</b> ({pinfo['duration_sec']:.1f}s / {pinfo['frames_visible']}f)<br/>
+                                Max Gap Bridged: <b>{pinfo['max_gap_frames']}f</b> ({pinfo['max_gap_sec']:.2f}s) · Recoveries: <b>{pinfo['recovery_count']}</b><br/>
+                                Baseline IDs on Target: <b>{len(bfrags)}</b> ({", ".join(f"#{b}" for b in bfrags[:6]) or "N/A"})<br/>
+                                Modalities: {_html.escape(pinfo['modalities'])}
+                            </div>
+                        </div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
+
+            eff_priv_mode = (
+                "Anonymize All Faces"
+                if privacy_mode == "Anonymize All Faces"
+                else ("Blur Everyone Except Selected Target" if solo_blur_others else "Off")
+            )
+            solo_cache_key = (
+                f"p{selected_pid}_{spotlight_mode[:3]}_{int(draw_trail_opt)}_"
+                f"{int(show_occ_hud_opt)}_{int(solo_skel_opt)}_{eff_priv_mode[:4]}_{solo_blur_style[:3]}"
+            )
             if render_solo_clicked:
                 if not source_video_path.exists():
                     st.error(f"Source video missing at `{source_video_path}`.")
@@ -4126,160 +5593,605 @@ def main() -> None:
                         src_fps=src_fps,
                         progress_bar=s_prog,
                         status_placeholder=s_stat,
+                        privacy_mode=eff_priv_mode,
+                        privacy_style=solo_blur_style,
+                        target_display_name=sel_name,
                     )
                     res.setdefault("solo_renders", {})[solo_cache_key] = str(solo_out)
-                    s_stat.success(f"Person #{selected_pid} spotlight video ready!")
+                    s_stat.success(f"Person #{selected_pid:02d} spotlight video ready!")
 
-            # Display selected person's individual stats & intervals
-            pinfo = person_stats[selected_pid]
-            sk1, sk2, sk3, sk4 = st.columns(4)
-            sk1.metric("Duration Visible", f"{pinfo['duration_sec']:.1f}s", delta=f"{pinfo['frames_visible']} frames", delta_color="off")
-            sk2.metric("Biometric Recoveries", pinfo["recovery_count"], delta=f"{pinfo['occlusion_gaps_count']} occlusion gap(s)", delta_color="off")
-            sk3.metric("ArcFace Samples", pinfo["face_samples"], delta="Face Locked" if pinfo["has_face_lock"] else "Head+Body+Skin", delta_color="off")
-            bfrags = pinfo["baseline_fragment_ids"]
-            sk4.metric("Baseline IDs on Target", len(bfrags), delta=", ".join(f"#{b}" for b in bfrags[:5]) or "N/A", delta_color="off")
-            st.caption(f"**Appearance Intervals:** {pinfo['intervals_text']}  |  **Modalities:** {pinfo['modalities']}")
+            st.caption(f"**Appearance Intervals:** `{pinfo['intervals_text']}`")
 
             solo_path_str = res.get("solo_renders", {}).get(solo_cache_key)
             if solo_path_str and Path(solo_path_str).exists():
                 sp = Path(solo_path_str)
                 s_bytes = sp.read_bytes()
                 s_mb = len(s_bytes) / (1024 * 1024)
-                sh_l, sh_r = st.columns([3, 1], vertical_alignment="center")
-                sh_l.subheader(f"Person #{selected_pid} Spotlight Output (H.264 / `yuv420p`)")
-                sh_r.download_button(
-                    label=f"⬇️ Download Person #{selected_pid} MP4 ({s_mb:.1f} MB)",
-                    data=s_bytes,
-                    file_name=sp.name,
-                    mime="video/mp4",
-                    width="stretch",
-                )
+                sh_l, sh_r = st.columns([3.2, 1.0], vertical_alignment="bottom")
+                with sh_l:
+                    priv_lbl = f" · PRIVACY: {eff_priv_mode.upper()}" if eff_priv_mode != "Off" else ""
+                    _render_cinema_bar(
+                        f"SPOTLIGHT FEED // TARGET PERSON #{selected_pid:02d}",
+                        f"{spotlight_mode.split('(')[0].strip().upper()}{priv_lbl} · H.264 YUV420P · {s_mb:.1f} MB",
+                    )
+                with sh_r:
+                    st.download_button(
+                        label=f"⬇️ Download Person #{selected_pid:02d} MP4 ({s_mb:.1f} MB)",
+                        data=s_bytes,
+                        file_name=sp.name,
+                        mime="video/mp4",
+                        width="stretch",
+                    )
                 st.video(s_bytes, format="video/mp4")
 
     # =======================================================================
-    # TAB 3 — Standard vs. Long-Horizon Comparison
+    # TAB 3 — Standard vs. Long-Horizon Comparison + Plotly Fragmentation Curve
     # =======================================================================
     with tab3:
-        splits_avoided = max(0, baseline_ids_count - confirmed_ids_count)
-        frag_red_pct = (
-            100.0 * (baseline_ids_count - confirmed_ids_count) / float(max(1, baseline_ids_count))
-            if baseline_ids_count > 0
-            else 0.0
-        )
-
-        ck1, ck2, ck3, ck4, ck5 = st.columns(5)
-        ck1.metric("Standard Baseline IDs", baseline_ids_count, delta="Pure IoU (15f coast)", delta_color="off")
-        ck2.metric("Long-Horizon Biometric IDs", confirmed_ids_count, delta="3-Tier Biometric AI", delta_color="off")
-        ck3.metric("ID Fragmentation Reduction", f"{frag_red_pct:.1f}%", delta="Lower IDs = less splitting", delta_color="off")
-        ck4.metric("Baseline Splits Avoided", splits_avoided, delta=f"{baseline_ids_count} → {confirmed_ids_count}", delta_color="off")
-        ck5.metric("Longest Occlusion Bridged", f"{max_occ_frames}f", delta=f"{max_occ_sec:.2f}s", delta_color="off")
-
-        st.divider()
-        cmp_c1, cmp_c2 = st.columns([2, 2], vertical_alignment="bottom")
-        with cmp_c1:
-            cmp_scope = st.radio(
-                "Comparison Scope",
-                options=["Full Scene (All People)", "Selected Person Only"],
-                index=0,
-                horizontal=True,
-                key="cmp_scope_radio",
+        if res is None:
+            st.info("Run the pipeline on a video first to benchmark Standard IoU vs. Long-Horizon Biometric AI.")
+        else:
+            splits_avoided = max(0, baseline_ids_count - confirmed_ids_count)
+            frag_red_pct = (
+                100.0 * (baseline_ids_count - confirmed_ids_count) / float(max(1, baseline_ids_count))
+                if baseline_ids_count > 0
+                else 0.0
             )
-        focus_cmp_pid: Optional[int] = None
-        focus_cmp_base_ids: Optional[Set[int]] = None
-        with cmp_c2:
-            if cmp_scope == "Selected Person Only" and person_stats:
-                focus_cmp_pid = st.selectbox(
-                    "Person to Compare (Standard Fragmentation vs Biometric Continuity)",
-                    options=sorted(person_stats.keys()),
+
+            ck1, ck2, ck3, ck4, ck5 = st.columns(5)
+            ck1.metric("Standard Baseline IDs", baseline_ids_count, delta="Pure IoU (15f coast)", delta_color="off")
+            ck2.metric("Long-Horizon Biometric IDs", confirmed_ids_count, delta="3-Tier Biometric AI", delta_color="off")
+            ck3.metric("Fragmentation Reduction", f"{frag_red_pct:.1f}%", delta="Lower IDs = less splitting", delta_color="off")
+            ck4.metric("Baseline Splits Avoided", splits_avoided, delta=f"{baseline_ids_count} → {confirmed_ids_count}", delta_color="off")
+            ck5.metric("Longest Occlusion Bridged", f"{max_occ_frames}f", delta=f"{max_occ_sec:.2f}s", delta_color="off")
+
+            if PLOTLY_AVAILABLE:
+                ch_left, ch_right = st.columns([2.4, 1.0])
+                cum_fig = build_cumulative_id_chart(baseline_timeline, consolidated_timeline, src_fps)
+                gauge_fig = build_fragmentation_gauge(frag_red_pct)
+                if cum_fig is not None:
+                    ch_left.plotly_chart(cum_fig, width="stretch")
+                if gauge_fig is not None:
+                    ch_right.plotly_chart(gauge_fig, width="stretch")
+
+            st.divider()
+            cmp_c1, cmp_c2 = st.columns([2, 2], vertical_alignment="bottom")
+            with cmp_c1:
+                cmp_scope = st.radio(
+                    "Comparison Scope",
+                    options=["Full Scene (All People)", "Selected Person Only"],
                     index=0,
-                    format_func=lambda pid: (
-                        f"Person #{pid} — Standard used {len(person_stats[pid]['baseline_fragment_ids'])} ID(s) vs 1 Biometric ID"
-                    ),
-                    key="cmp_focus_pid",
+                    horizontal=True,
+                    key="cmp_scope_radio",
                 )
-                focus_cmp_base_ids = set(person_stats[focus_cmp_pid]["baseline_fragment_ids"])
+            focus_cmp_pid: Optional[int] = None
+            focus_cmp_base_ids: Optional[Set[int]] = None
+            with cmp_c2:
+                if cmp_scope == "Selected Person Only" and person_stats:
+                    focus_cmp_pid = st.selectbox(
+                        "Person to Compare (Standard Fragmentation vs Biometric Continuity)",
+                        options=sorted(person_stats.keys()),
+                        index=0,
+                        format_func=lambda pid: (
+                            f"Person #{pid:02d} — Standard used {len(person_stats[pid]['baseline_fragment_ids'])} ID(s) vs 1 Biometric ID"
+                        ),
+                        key="cmp_focus_pid",
+                    )
+                    focus_cmp_base_ids = set(person_stats[focus_cmp_pid]["baseline_fragment_ids"])
 
-        render_cmp_clicked = st.button(
-            "⚖️ Render Side-by-Side Comparison Video",
-            type="primary",
-            width="stretch",
-        )
-
-        cmp_cache_key = "full_scene" if focus_cmp_pid is None else f"person_{focus_cmp_pid}"
-        if render_cmp_clicked:
-            if not source_video_path.exists():
-                st.error(f"Source video missing at `{source_video_path}`.")
-            else:
-                cmp_out = UPLOADS_DIR / f"{source_video_path.stem}_comparison_{cmp_cache_key}_{datetime.now().strftime('%H%M%S')}.mp4"
-                c_prog = st.progress(0.0)
-                c_stat = st.empty()
-                render_side_by_side_comparison_video(
-                    source_video_path=source_video_path,
-                    output_path=cmp_out,
-                    baseline_timeline=baseline_timeline,
-                    consolidated_timeline=consolidated_timeline,
-                    src_fps=src_fps,
-                    focus_person_id=focus_cmp_pid,
-                    focus_baseline_ids=focus_cmp_base_ids,
-                    progress_bar=c_prog,
-                    status_placeholder=c_stat,
-                )
-                res.setdefault("comparison_renders", {})[cmp_cache_key] = str(cmp_out)
-                c_stat.success("Side-by-Side Comparison H.264 video ready!")
-
-        cmp_path_str = res.get("comparison_renders", {}).get(cmp_cache_key)
-        if cmp_path_str and Path(cmp_path_str).exists():
-            cp = Path(cmp_path_str)
-            c_bytes = cp.read_bytes()
-            c_mb = len(c_bytes) / (1024 * 1024)
-            ch_l, ch_r = st.columns([3, 1], vertical_alignment="center")
-            ch_l.subheader("Side-by-Side Comparison (Left: Standard Baseline | Right: Long-Horizon Biometric AI)")
-            ch_r.download_button(
-                label=f"⬇️ Download Comparison MP4 ({c_mb:.1f} MB)",
-                data=c_bytes,
-                file_name=cp.name,
-                mime="video/mp4",
+            render_cmp_clicked = st.button(
+                "⚖️ Render Side-by-Side Comparison Video",
+                type="primary",
                 width="stretch",
             )
-            st.video(c_bytes, format="video/mp4")
+
+            cmp_cache_key = "full_scene" if focus_cmp_pid is None else f"person_{focus_cmp_pid}"
+            if render_cmp_clicked:
+                if not source_video_path.exists():
+                    st.error(f"Source video missing at `{source_video_path}`.")
+                else:
+                    cmp_out = UPLOADS_DIR / f"{source_video_path.stem}_comparison_{cmp_cache_key}_{datetime.now().strftime('%H%M%S')}.mp4"
+                    c_prog = st.progress(0.0)
+                    c_stat = st.empty()
+                    render_side_by_side_comparison_video(
+                        source_video_path=source_video_path,
+                        output_path=cmp_out,
+                        baseline_timeline=baseline_timeline,
+                        consolidated_timeline=consolidated_timeline,
+                        src_fps=src_fps,
+                        focus_person_id=focus_cmp_pid,
+                        focus_baseline_ids=focus_cmp_base_ids,
+                        progress_bar=c_prog,
+                        status_placeholder=c_stat,
+                    )
+                    res.setdefault("comparison_renders", {})[cmp_cache_key] = str(cmp_out)
+                    c_stat.success("Side-by-Side Comparison H.264 video ready!")
+
+            cmp_path_str = res.get("comparison_renders", {}).get(cmp_cache_key)
+            if cmp_path_str and Path(cmp_path_str).exists():
+                cp = Path(cmp_path_str)
+                c_bytes = cp.read_bytes()
+                c_mb = len(c_bytes) / (1024 * 1024)
+                ch_l, ch_r = st.columns([3.2, 1.0], vertical_alignment="bottom")
+                with ch_l:
+                    _render_cinema_bar(
+                        "BENCHMARK FEED // LEFT: STANDARD BASELINE  |  RIGHT: LONG-HORIZON BIOMETRIC AI",
+                        f"H.264 YUV420P · {c_mb:.1f} MB",
+                    )
+                with ch_r:
+                    st.download_button(
+                        label=f"⬇️ Download Comparison MP4 ({c_mb:.1f} MB)",
+                        data=c_bytes,
+                        file_name=cp.name,
+                        mime="video/mp4",
+                        width="stretch",
+                    )
+                st.video(c_bytes, format="video/mp4")
 
     # =======================================================================
-    # TAB 4 — Biometric Recovery Log & Timeline
+    # TAB 4 — Spatial Zones, Movement Heatmap, Behavior Alerts & Telemetry
     # =======================================================================
     with tab4:
-        st.subheader("Biometric & Occlusion Recovery Events")
-        if recoveries:
-            rec_df = pd.DataFrame(recoveries)
-            st.dataframe(rec_df, width="stretch", hide_index=True)
+        if res is None or not consolidated_timeline:
+            st.info("Run the pipeline on a video first to configure Spatial Zones, render the Traffic Heatmap, and inspect Behavior Alerts.")
         else:
-            st.info(
-                "No disappearance, turn-bridge, or outfit-change recoveries were required in this clip "
-                "(all confirmed identities stayed continuously tracked or remained ambiguous)."
+            st.markdown("#### 🗺️ Polygon Zone & Loitering Configuration")
+            zc1, zc2, zc3 = st.columns([1.4, 2.0, 1.0])
+            with zc1:
+                zone_preset_choice = st.selectbox(
+                    "Zone Preset Template",
+                    options=[
+                        "Left Half / Counter + Right Half / Entrance",
+                        "Full Frame",
+                        "Left Half / Counter",
+                        "Right Half / Entrance",
+                        "Center Box",
+                        "Custom Polygon",
+                    ],
+                    index=0,
+                    key="zone_preset_select",
+                )
+            with zc2:
+                default_coord_str = format_polygon_coords(
+                    ZONE_PRESETS.get(zone_preset_choice, ZONE_PRESETS["Center Box"])
+                )
+                custom_coords_txt = st.text_input(
+                    "Custom Normalized Polygon (`x1,y1; x2,y2; ...`)",
+                    value=default_coord_str,
+                    disabled=(zone_preset_choice != "Custom Polygon"),
+                    key=f"zone_custom_coords_{zone_preset_choice}",
+                )
+            with zc3:
+                loiter_sec_cfg = st.slider(
+                    "Loiter Alert (sec)",
+                    min_value=2.0,
+                    max_value=60.0,
+                    value=10.0,
+                    step=1.0,
+                    key="zone_loiter_slider",
+                )
+
+            if zone_preset_choice == "Left Half / Counter + Right Half / Entrance":
+                active_zones = [
+                    PolygonZone("Left Half / Counter", list(ZONE_PRESETS["Left Half / Counter"]), (212, 182, 6)),
+                    PolygonZone("Right Half / Entrance", list(ZONE_PRESETS["Right Half / Entrance"]), (11, 158, 245)),
+                ]
+            elif zone_preset_choice == "Custom Polygon":
+                parsed_pts = parse_polygon_coords(custom_coords_txt) or list(ZONE_PRESETS["Center Box"])
+                active_zones = [PolygonZone("Custom Zone", parsed_pts, (129, 185, 16))]
+            else:
+                active_zones = [PolygonZone(zone_preset_choice, list(ZONE_PRESETS[zone_preset_choice]), (212, 182, 6))]
+
+            fw = int(res.get("width", 1280))
+            fh = int(res.get("height", 720))
+            zone_res = ZoneAnalyzer(
+                zones=active_zones,
+                loiter_threshold_sec=loiter_sec_cfg,
+                src_fps=src_fps,
+            ).analyze_timeline(consolidated_timeline, frame_size=(fw, fh), src_fps=src_fps)
+            st.session_state["last_zone_result_v6"] = zone_res
+
+            # Generate & cache Movement Heatmap over clean median background
+            hm_cache_key = f"{source_video_path.name}_{len(consolidated_timeline)}"
+            hm_cached = st.session_state.get("last_heatmap_result_v6")
+            if hm_cached is None or hm_cached.get("cache_key") != hm_cache_key:
+                hm_gen = HeatmapGenerator(alpha=0.45)
+                hm_data = hm_gen.generate(
+                    consolidated_timeline,
+                    video_path=source_video_path if source_video_path.exists() else None,
+                    frame_size=(fw, fh),
+                )
+                hm_data["cache_key"] = hm_cache_key
+                st.session_state["last_heatmap_result_v6"] = hm_data
+                hm_cached = hm_data
+
+            hm_col, tbl_col = st.columns([1.45, 1.55], vertical_alignment="top")
+            with hm_col:
+                st.markdown("#### 🔥 Traffic Movement Heatmap (`COLORMAP_TURBO`)")
+                overlay_zones_on_hm = st.toggle("Overlay Polygon Zones on Heatmap", value=True, key="hm_overlay_zones")
+                hm_bgr_vis = hm_cached["bgr_image"]
+                if overlay_zones_on_hm:
+                    peak_occ_map = {z["zone_name"]: z["peak_occupancy"] for z in zone_res["zone_summaries"]}
+                    alert_zset = {z["zone_name"] for z in zone_res["zone_summaries"] if z["loitering_alerts"] > 0}
+                    hm_bgr_vis = draw_zones_overlay(hm_bgr_vis, active_zones, active_counts=peak_occ_map, alert_zones=alert_zset)
+                st.image(cv2.cvtColor(hm_bgr_vis, cv2.COLOR_BGR2RGB), width="stretch")
+                st.download_button(
+                    label="⬇️ Download Heatmap PNG",
+                    data=hm_cached["png_bytes"],
+                    file_name=f"{source_video_path.stem}_traffic_heatmap.png",
+                    mime="image/png",
+                    width="stretch",
+                )
+
+            with tbl_col:
+                st.markdown("#### 📊 Zone Dwell-Time & Crossing Summary")
+                if zone_res["zone_summaries"]:
+                    st.dataframe(pd.DataFrame(zone_res["zone_summaries"]), width="stretch", hide_index=True)
+
+                st.markdown("#### 🚨 Behavior & Spatial Anomaly Feed")
+                combined_alerts: List[Dict[str, Any]] = []
+                for ev in zone_res["events"]:
+                    combined_alerts.append(
+                        {
+                            "Time (s)": ev["timestamp_sec"],
+                            "Person": f"#{int(ev['track_id']):02d}",
+                            "Event Type": ev["event_type"],
+                            "Context": ev["zone_name"],
+                            "Duration (s)": ev["duration_sec"],
+                            "Severity": ev["severity"],
+                        }
+                    )
+                if pose_result:
+                    for ev in pose_result.get("events", []):
+                        combined_alerts.append(
+                            {
+                                "Time (s)": ev["timestamp_sec"],
+                                "Person": f"#{int(ev['track_id']):02d}",
+                                "Event Type": ev["event_type"],
+                                "Context": "Pose Kinetics",
+                                "Duration (s)": ev["duration_sec"],
+                                "Severity": ev["severity"],
+                            }
+                        )
+                combined_alerts.sort(key=lambda r: float(r["Time (s)"]))
+                if combined_alerts:
+                    st.dataframe(pd.DataFrame(combined_alerts), width="stretch", hide_index=True)
+                else:
+                    st.success("Zero loitering, fall, running, or hands-raised anomalies detected.")
+
+            if zone_res["track_zone_stats"]:
+                with st.expander("📋 Per-Person Zone Dwell Breakdown", expanded=False):
+                    st.dataframe(pd.DataFrame(zone_res["track_zone_stats"]), width="stretch", hide_index=True)
+
+            st.divider()
+            if PLOTLY_AVAILABLE and person_stats:
+                gantt_fig = build_gantt_presence_chart(person_stats, recoveries, src_fps)
+                if gantt_fig is not None:
+                    st.plotly_chart(gantt_fig, width="stretch")
+
+            with st.expander(f"🧬 Biometric & Occlusion Recovery Event Log ({len(recoveries)} events)", expanded=False):
+                if recoveries:
+                    rec_df = pd.DataFrame(recoveries)
+                    ev_types = sorted(rec_df["Recovery Type"].dropna().unique().tolist())
+                    selected_types = st.multiselect(
+                        "Filter Recovery Event Types",
+                        options=ev_types,
+                        default=ev_types,
+                        key="recovery_type_filter",
+                    )
+                    filtered_df = rec_df[rec_df["Recovery Type"].isin(selected_types)] if selected_types else rec_df
+                    st.dataframe(filtered_df, width="stretch", hide_index=True)
+                else:
+                    st.info("No disappearance, turn-bridge, or outfit-change recoveries were required in this clip.")
+
+    # =======================================================================
+    # TAB 5 — Biometric Vault & Watchlist (Persistent Cross-Video Memory)
+    # =======================================================================
+    with tab5:
+        st.markdown("#### 🔐 Enroll Reference Photo onto Persistent Watchlist")
+        st.caption(
+            "Enroll a named person (e.g. **Cashier - Arjun**, **VIP Guest**) BEFORE running a video so they are "
+            "automatically recognized across cameras and outfit changes via Tier-1 ArcFace + Head/Skin biometrics."
+        )
+        en_c1, en_c2, en_c3 = st.columns([2.0, 1.4, 1.0], vertical_alignment="bottom")
+        with en_c1:
+            ref_photo = st.file_uploader(
+                "Upload Reference Portrait (.jpg, .jpeg, .png)",
+                type=["jpg", "jpeg", "png"],
+                key="vault_ref_photo_upload",
+            )
+        with en_c2:
+            ref_name = st.text_input(
+                "Display Name",
+                placeholder="e.g. Cashier - Arjun",
+                key="vault_ref_name_input",
+            )
+        with en_c3:
+            ref_watchlist = st.toggle("Flag as Watchlist", value=True, key="vault_ref_wl_toggle")
+            enroll_clicked = st.button(
+                "➕ Enroll into Vault",
+                type="primary",
+                disabled=(ref_photo is None or not ref_name.strip()),
+                width="stretch",
             )
 
-        st.subheader("Per-ID Presence Timeline & Biometric Modalities")
-        if person_stats:
-            tl_rows = []
-            for pid in sorted(person_stats.keys()):
-                ps = person_stats[pid]
-                tl_rows.append(
-                    {
-                        "Person ID": f"#{pid}",
-                        "First Frame": ps["first_frame"],
-                        "Last Frame": ps["last_frame"],
-                        "Frames Tracked": ps["frames_visible"],
-                        "Duration (s)": ps["duration_sec"],
-                        "Occlusion Gaps": ps["occlusion_gaps_count"],
-                        "Max Gap (f)": ps["max_gap_frames"],
-                        "Recoveries": ps["recovery_count"],
-                        "Baseline IDs Used": len(ps["baseline_fragment_ids"]),
-                        "Biometric Modalities": ps["modalities"],
-                        "Appearance Intervals": ps["intervals_text"],
-                    }
+        if enroll_clicked and ref_photo is not None and ref_name.strip():
+            raw_bytes = np.frombuffer(ref_photo.getvalue(), dtype=np.uint8)
+            img_bgr = cv2.imdecode(raw_bytes, cv2.IMREAD_COLOR)
+            if img_bgr is None:
+                st.error("Could not decode uploaded image.")
+            else:
+                with st.spinner("Extracting ArcFace + DINOv2 head + CIE Lab skin embeddings..."):
+                    f_app = load_face_analyzer(device=device_now)
+                    d_enc = load_reid_encoder(reid_variant="dinov2_vitb14", device=device_now)
+                    enr = vault.enroll_reference_photo(
+                        image_bgr=img_bgr,
+                        display_name=ref_name.strip(),
+                        face_app=f_app,
+                        dinov2_encoder=d_enc,
+                        is_watchlist=ref_watchlist,
+                    )
+                st.success(
+                    f"Enrolled **{enr['display_name']}** as `Vault #{enr['vault_id']}` · "
+                    f"Face Lock: `{'YES' if enr['face_extracted'] else 'NO'}` · "
+                    f"Modalities: `{', '.join(enr['modalities_stored']) or 'none'}`"
                 )
-            st.dataframe(pd.DataFrame(tl_rows), width="stretch", hide_index=True)
+                st.rerun()
+
+        st.divider()
+        vault_items = vault.list_identities(watchlist_only=False, include_sightings=True)
+        vh_l, vh_r = st.columns([3.0, 1.0], vertical_alignment="center")
+        with vh_l:
+            st.markdown(f"#### 🗃️ Stored Vault Identities ({len(vault_items)} profiles in `data/biometric_vault.db`)")
+        with vh_r:
+            if vault_items and st.button("🗑️ Clear Entire Vault", key="vault_clear_all_btn", width="stretch"):
+                n_rem = vault.clear_vault()
+                st.warning(f"Cleared {n_rem} profiles from Biometric Vault.")
+                st.rerun()
+
+        if not vault_items:
+            st.info("Biometric Vault is currently empty. Enroll a reference photo above or run a video with Vault Matching enabled.")
         else:
-            st.info("No confirmed tracks to display.")
+            for row_start in range(0, len(vault_items), 4):
+                chunk = vault_items[row_start : row_start + 4]
+                vcols = st.columns(4)
+                for vcol, item in zip(vcols, chunk):
+                    with vcol:
+                        vid = item["vault_id"]
+                        vname = item["display_name"] or f"Unnamed Vault #{vid}"
+                        uri = _thumb_to_data_uri(item.get("thumbnail_jpeg"))
+                        img_tag = f'<img src="{uri}" alt="{_html.escape(vname)}" />' if uri else '<span class="mono" style="color:#475569;">NO CROP</span>'
+                        wl_b = '<span class="mini-badge" style="background:rgba(244,63,94,0.22);color:#FB7185;border:1px solid rgba(251,113,133,0.45);">WATCHLIST</span>' if item["is_watchlist"] else ""
+                        f_b = '<span class="mini-badge mb-face">ARCFACE</span>' if item["has_face"] else '<span class="mini-badge mb-angle">HEAD/SKIN</span>'
+                        st.markdown(
+                            f"""
+                            <div class="dossier-card">
+                              <div class="reticle-wrap">
+                                <span class="reticle-corner rc-tl"></span><span class="reticle-corner rc-tr"></span>
+                                <span class="reticle-corner rc-bl"></span><span class="reticle-corner rc-br"></span>
+                                {img_tag}
+                              </div>
+                              <div class="dossier-id">V#{vid:02d} · {_html.escape(vname)}</div>
+                              <div class="dossier-sub">Videos: {item['videos_seen_count']} · Sightings: {len(item.get('sightings', []))}</div>
+                              <div>{wl_b}{f_b}</div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True,
+                        )
+                        with st.expander(f"Manage V#{vid:02d}", expanded=False):
+                            ed_name = st.text_input("Rename", value=item["display_name"] or "", key=f"v_ren_txt_{vid}")
+                            ed_wl = st.checkbox("Watchlist", value=bool(item["is_watchlist"]), key=f"v_ren_wl_{vid}")
+                            bc1, bc2 = st.columns(2)
+                            if bc1.button("Save", key=f"v_ren_btn_{vid}", width="stretch"):
+                                vault.rename_identity(vid, ed_name.strip() or None, is_watchlist=ed_wl)
+                                st.rerun()
+                            if bc2.button("Delete", key=f"v_del_btn_{vid}", width="stretch"):
+                                vault.delete_identity(vid)
+                                st.rerun()
+
+            all_sightings = vault.get_sightings()
+            if all_sightings:
+                st.markdown("#### 🛰️ Cross-Video / Multi-Camera Sighting History")
+                st.dataframe(pd.DataFrame(all_sightings), width="stretch", hide_index=True)
+
+    # =======================================================================
+    # TAB 6 — One-Click Forensic Export & Live CCTV (RTSP) / Webcam Monitor
+    # =======================================================================
+    with tab6:
+        st.markdown("#### 📄 One-Click Forensic Report & Telemetry Export")
+        if res is None:
+            st.info("Process a video first to generate the multi-section Forensic PDF Report and Telemetry CSV.")
+        else:
+            zone_for_exp = st.session_state.get("last_zone_result_v6")
+            hm_for_exp = st.session_state.get("last_heatmap_result_v6")
+            if hm_for_exp is None and consolidated_timeline:
+                fw = int(res.get("width", 1280))
+                fh = int(res.get("height", 720))
+                hm_for_exp = HeatmapGenerator(alpha=0.45).generate(
+                    consolidated_timeline,
+                    video_path=source_video_path if source_video_path.exists() else None,
+                    frame_size=(fw, fh),
+                )
+                st.session_state["last_heatmap_result_v6"] = hm_for_exp
+
+            exp_c1, exp_c2 = st.columns(2)
+            with exp_c1:
+                pdf_bytes = generate_forensic_pdf(
+                    job_result=res,
+                    heatmap_rgb=hm_for_exp["rgb_image"] if hm_for_exp else None,
+                    zone_result=zone_for_exp,
+                    pose_result=pose_result,
+                    vault_matches=vault_matches,
+                )
+                st.download_button(
+                    label=f"📄 Download Forensic PDF Report ({len(pdf_bytes) / 1024:.0f} KB)",
+                    data=pdf_bytes,
+                    file_name=f"{source_video_path.stem or 'tracking'}_forensic_report.pdf",
+                    mime="application/pdf",
+                    type="primary",
+                    width="stretch",
+                )
+            with exp_c2:
+                csv_bytes = generate_forensic_csv(
+                    job_result=res,
+                    zone_result=zone_for_exp,
+                    pose_result=pose_result,
+                    vault_matches=vault_matches,
+                )
+                st.download_button(
+                    label=f"📊 Download Telemetry CSV ({len(csv_bytes) / 1024:.1f} KB)",
+                    data=csv_bytes,
+                    file_name=f"{source_video_path.stem or 'tracking'}_telemetry.csv",
+                    mime="text/csv",
+                    width="stretch",
+                )
+
+        st.divider()
+        st.markdown("#### 📡 Live CCTV (RTSP) / Webcam Real-Time Monitor")
+        st.caption(
+            "Connect a local webcam (`0`) or live IP camera (`rtsp://user:pass@ip:554/stream`) for fast Pass-1 "
+            "tracking with Biometric Vault watchlist alerts and zero-cost Pose Fall / Hands-Raised / Running alerts."
+        )
+        lc1, lc2, lc3 = st.columns([1.2, 2.0, 1.0], vertical_alignment="bottom")
+        with lc1:
+            live_src_mode = st.radio(
+                "Stream Source",
+                options=["Webcam (Index 0)", "RTSP Stream URL"],
+                index=0,
+                horizontal=True,
+                key="live_src_mode",
+            )
+        with lc2:
+            if live_src_mode == "Webcam (Index 0)":
+                live_source_val: Any = st.number_input("Webcam Device Index", min_value=0, max_value=8, value=0, step=1, key="live_cam_idx")
+            else:
+                live_source_val = st.text_input(
+                    "RTSP URL",
+                    placeholder="rtsp://username:password@192.168.1.50:554/stream1",
+                    key="live_rtsp_url",
+                )
+        with lc3:
+            live_max_frames = st.slider("Session Frame Cap", min_value=30, max_value=1500, value=240, step=30, key="live_max_frames")
+
+        lb1, lb2 = st.columns(2)
+        start_live = lb1.button("▶️ Start Live Monitor", type="primary", width="stretch", key="live_start_btn")
+        stop_live = lb2.button("⏹️ Stop Live Monitor", width="stretch", key="live_stop_btn")
+
+        if stop_live:
+            st.session_state["live_monitor_running"] = False
+        if start_live:
+            st.session_state["live_monitor_running"] = True
+
+        if st.session_state.get("live_monitor_running", False):
+            if live_src_mode == "RTSP Stream URL" and not str(live_source_val).strip():
+                st.warning("Enter a valid `rtsp://...` URL before starting Live Monitor.")
+                st.session_state["live_monitor_running"] = False
+            else:
+                live_status = st.empty()
+                live_alert_box = st.empty()
+                live_frame_slot = st.empty()
+
+                cap_live = cv2.VideoCapture(int(live_source_val) if live_src_mode == "Webcam (Index 0)" else str(live_source_val).strip())
+                if not cap_live.isOpened():
+                    st.error(f"Could not open live stream source `{live_source_val}`.")
+                    st.session_state["live_monitor_running"] = False
+                else:
+                    try:
+                        live_det = load_nextgen_detector(model_name=detector_weights, device=device_now)
+                        live_det.classes = [0]
+                        live_det.conf = conf_thresh
+                        live_det.imgsz = min(int(detector_imgsz), 768)
+                        live_face = load_face_analyzer(device=device_now) if match_vault else None
+                        live_tracker = LongHorizonTracker(
+                            config=TrackerConfig(
+                                det_thresh=conf_thresh,
+                                max_active_miss=25,
+                                probation_frames=15,
+                                stitch_min_sim=0.72,
+                                margin_min_diff=0.08,
+                            )
+                        )
+                        live_pose_analyzer = PoseBehaviorAnalyzer(smooth_window=5)
+                        live_pose_history: List[Dict[str, Any]] = []
+                        live_vault_names: Dict[int, str] = {}
+                        live_fps_ema = 15.0
+
+                        for f_i in range(1, int(live_max_frames) + 1):
+                            if not st.session_state.get("live_monitor_running", False):
+                                break
+                            ok_l, fr_l = cap_live.read()
+                            if not ok_l or fr_l is None:
+                                live_status.warning("Live stream ended or frame read failed.")
+                                break
+                            t_l0 = time.perf_counter()
+                            l_boxes, l_scores, l_cls, l_kpts = live_det.detect(fr_l)
+                            n_ld = len(l_boxes)
+                            l_dets: List[Detection] = []
+                            for i in range(n_ld):
+                                x1, y1, x2, y2 = [int(round(v)) for v in l_boxes[i]]
+                                x1, y1 = max(0, x1), max(0, y1)
+                                x2, y2 = min(fr_l.shape[1], max(x1 + 4, x2)), min(fr_l.shape[0], max(y1 + 4, y2))
+                                emb_i = AppearanceEncoder._hsv_hog_embedding(fr_l[y1:y2, x1:x2])
+                                d_y = float(y2) / float(max(1, fr_l.shape[0]))
+                                l_dets.append(Detection(box=l_boxes[i], score=float(l_scores[i]), class_id=0, embedding=emb_i, depth=d_y))
+
+                            l_res = live_tracker.update(fr_l, l_dets)
+                            act_list_for_pose: List[Dict[str, Any]] = []
+                            active_alerts_live: List[str] = []
+
+                            for tr in l_res.active_tracks:
+                                tb = tr.current_box()
+                                mi = _match_box_to_detection(tb, l_boxes) if n_ld > 0 else None
+                                tr_kp = l_kpts[mi] if mi is not None else None
+                                act_list_for_pose.append({"track_id": tr.track_id, "box": tb, "keypoints": tr_kp})
+
+                                # Watchlist ArcFace check every 8th frame for unnamed active tracks
+                                if (
+                                    match_vault
+                                    and live_face is not None
+                                    and live_face.available
+                                    and tr.track_id not in live_vault_names
+                                    and f_i % 8 == 1
+                                ):
+                                    hb = compute_head_box_above_shoulders(tb, tr_kp if tr_kp is not None else np.zeros((17, 3), dtype=np.float32), fr_l.shape[:2])
+                                    f_obs = live_face.extract_from_head_box(fr_l, hb)
+                                    if f_obs is not None:
+                                        vm = vault.match_track_to_vault({"face_arcface": f_obs[0]}, face_thresh=0.42)
+                                        if vm is not None:
+                                            live_vault_names[tr.track_id] = vm[1] or f"Vault #{vm[0]}"
+                                            active_alerts_live.append(f"WATCHLIST MATCH: {live_vault_names[tr.track_id]} (#{tr.track_id}, {vm[2]:.2f})")
+
+                            live_pose_history.append({"frame_idx": f_i, "active": act_list_for_pose})
+                            if len(live_pose_history) > 25:
+                                live_pose_history = live_pose_history[-25:]
+                            p_now = live_pose_analyzer.analyze_timeline(live_pose_history, src_fps=max(5.0, live_fps_ema))
+                            f_lbls = p_now["frame_labels"].get(f_i, {})
+
+                            vis_l = fr_l.copy()
+                            for tr in l_res.active_tracks:
+                                tb = tr.current_box()
+                                x1, y1, x2, y2 = [int(round(v)) for v in tb]
+                                col = track_color_bgr(tr.track_id)
+                                cv2.rectangle(vis_l, (x1, y1), (x2, y2), col, 2, cv2.LINE_AA)
+                                vtag = f" [{live_vault_names[tr.track_id]}]" if tr.track_id in live_vault_names else ""
+                                blbl = f_lbls.get(tr.track_id, "")
+                                btag = f" | {blbl}" if blbl in ("FALL_ALERT", "HANDS_RAISED", "RUNNING") else ""
+                                if blbl in ("FALL_ALERT", "HANDS_RAISED", "RUNNING"):
+                                    active_alerts_live.append(f"{blbl} on Person #{tr.track_id}{vtag}")
+                                draw_label_pill(vis_l, f"LIVE #{tr.track_id}{vtag}{btag}", (x1, max(20, y1)), col, (15, 15, 15), font_scale=0.48)
+
+                            dt_l = max(1e-4, time.perf_counter() - t_l0)
+                            live_fps_ema = 0.85 * live_fps_ema + 0.15 * (1.0 / dt_l)
+                            live_status.markdown(
+                                f"**LIVE STREAM** · Frame `{f_i}/{live_max_frames}` · "
+                                f"**FPS:** `{live_fps_ema:.1f}` · **Active Tracks:** `{len(l_res.active_tracks)}`"
+                            )
+                            if active_alerts_live:
+                                live_alert_box.error(" | ".join(active_alerts_live))
+                            live_frame_slot.image(cv2.cvtColor(vis_l, cv2.COLOR_BGR2RGB), width="stretch")
+                    finally:
+                        cap_live.release()
+                        st.session_state["live_monitor_running"] = False
 
 
 if __name__ == "__main__":

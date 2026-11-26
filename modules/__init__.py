@@ -1,0 +1,66 @@
+"""Modular extensions for the Long-Horizon Multi-Object Tracker."""
+
+from modules.biometric_vault import BiometricVault, VALID_MODALITIES
+from modules.forensics_live import (
+    apply_privacy_blur,
+    generate_forensic_csv,
+    generate_forensic_pdf,
+)
+from modules.nextgen_ai import (
+    CLIPTargetSearcher,
+    DEPTH_CATALOG,
+    DETECTOR_CATALOG,
+    IMAGENET_MEAN_BGR,
+    MaskCleaner,
+    NextGenDepthEstimator,
+    NextGenPoseDetector,
+    NextGenReIDEncoder,
+    REID_CATALOG,
+    export_to_tensorrt,
+    load_clip_searcher,
+    load_mask_cleaner,
+    load_nextgen_depth_estimator,
+    load_nextgen_detector,
+    load_nextgen_reid_encoder,
+)
+from modules.spatial_behavior import (
+    HeatmapGenerator,
+    PolygonZone,
+    PoseBehaviorAnalyzer,
+    ZONE_PRESETS,
+    ZoneAnalyzer,
+    draw_zones_overlay,
+    format_polygon_coords,
+    parse_polygon_coords,
+)
+
+__all__ = [
+    "BiometricVault",
+    "VALID_MODALITIES",
+    "PolygonZone",
+    "ZONE_PRESETS",
+    "ZoneAnalyzer",
+    "HeatmapGenerator",
+    "PoseBehaviorAnalyzer",
+    "draw_zones_overlay",
+    "parse_polygon_coords",
+    "format_polygon_coords",
+    "DETECTOR_CATALOG",
+    "REID_CATALOG",
+    "DEPTH_CATALOG",
+    "IMAGENET_MEAN_BGR",
+    "NextGenPoseDetector",
+    "MaskCleaner",
+    "NextGenReIDEncoder",
+    "NextGenDepthEstimator",
+    "CLIPTargetSearcher",
+    "export_to_tensorrt",
+    "load_nextgen_detector",
+    "load_mask_cleaner",
+    "load_nextgen_reid_encoder",
+    "load_nextgen_depth_estimator",
+    "load_clip_searcher",
+    "apply_privacy_blur",
+    "generate_forensic_pdf",
+    "generate_forensic_csv",
+]

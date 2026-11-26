@@ -37,3 +37,11 @@ data/*.mkv
 Thumbs.db
 .vscode/
 .idea/
+*.pyc
+*.engine
+*.mp4
+*.mov
+*.avi
+*.mkv
+output/
+data/*.db
